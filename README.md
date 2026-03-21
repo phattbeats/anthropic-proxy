@@ -15,7 +15,7 @@ docker build -t anthropic-proxy .
 docker run -d \
   --name anthropic-proxy \
   --restart unless-stopped \
-  --network phattvip \
+  --network custom \
   -p 4010:4010 \
   anthropic-proxy
 ```
@@ -24,7 +24,7 @@ docker run -d \
 1. Go to Docker tab → Add Container
 2. **Name:** `anthropic-proxy`
 3. **Repository:** (use the built image or point to a registry)
-4. **Network:** `phattvip`
+4. **Network:** `custom`
 5. **Port:** `4010:4010`
 6. **Restart Policy:** `unless-stopped`
 
@@ -32,12 +32,7 @@ docker run -d \
 
 Update LiteLLM config to point Anthropic models at the container:
 - **API Base:** `http://anthropic-proxy:4010` (if on same Docker network)
-- Or `http://10.0.0.100:4010` (if using host port mapping)
-
-Remove from OpenClaw:
-- Delete proxy startup from `AGENTS.md`
-- Delete heartbeat check #3 from `HEARTBEAT.md`
-- Kill any running proxy process inside OpenClaw container
+- Or `http://YOURIP:4010` (if using host port mapping)
 
 ## Health Check
 ```bash
