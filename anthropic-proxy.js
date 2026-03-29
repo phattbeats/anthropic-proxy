@@ -27,11 +27,16 @@ const OAUTH_HEADERS = {
 };
 
 const MODELS = [
-  { id: 'claude-opus-4-5', name: 'Claude Opus 4.5' },
-  { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5' },
-  { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
+  // Current shipping models (as of 2026-03)
   { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
   { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+  { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
+  { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet (2024-10-22)' },
+  { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku (2024-10-22)' },
+  // Legacy aliases for compatibility
+  { id: 'claude-opus-4-5', name: 'Claude Opus 4.5 (legacy)' },
+  { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5 (legacy)' },
+  { id: 'claude-haiku-3', name: 'Claude Haiku 3 (legacy)' },
 ];
 
 function modelsResponse() {
@@ -318,6 +323,17 @@ const handler = (req, res) => {
       return;
     }
 
+    // Health check endpoint
+    if (req.url === '/health' || req.url === '/v1/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        status: 'ok',
+        proxy: 'anthropic-oauth-proxy',
+        version: '2.0',
+        timestamp: new Date().toISOString(),
+      }));
+    }
+
     // Anything else — passthrough
     console.log(`[PROXY] Passthrough ${req.method} ${req.url}`);
     headers['content-length'] = String(rawBody.length);
@@ -339,6 +355,6 @@ if (USE_HTTPS) {
 server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
   console.log(`[PROXY] Anthropic OAuth proxy v2 listening on :${PORT} (${proto.toUpperCase()})`);
-  console.log(`[PROXY] Endpoints: /v1/models, /v1/chat/completions, /v1/messages`);
+  console.log(`[PROXY] Endpoints: /health, /v1/models, /v1/chat/completions, /v1/messages`);
   console.log(`[PROXY] Point SillyTavern/LiteLLM at: ${proto}://172.18.0.27:${PORT}`);
 });
