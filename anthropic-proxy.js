@@ -56,12 +56,21 @@ function modelsResponse() {
 // Parameters SillyTavern sends that Anthropic doesn't support — strip them
 const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'seed', 'response_format', 'function_call', 'functions'];
 
+// Models that reject temperature parameter via the Anthropic API
+// (Opus 4.7 introduced this restriction; other models accept it)
+const MODELS_NO_TEMPERATURE = ['claude-opus-4-7'];
+
 // Convert OpenAI chat/completions format to Anthropic messages format
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
 
-  // Strip unsupported OpenAI parameters before conversion
+  // Strip SillyTavern-specific unsupported parameters
   for (const p of STRIP_PARAMS) delete payload[p];
+
+  // Strip temperature only for models that reject it
+  if (payload.model && MODELS_NO_TEMPERATURE.includes(payload.model)) {
+    delete payload.temperature;
+  }
 
   const result = {
     model: payload.model,
