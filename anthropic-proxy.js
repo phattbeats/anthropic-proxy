@@ -93,8 +93,9 @@ function openAIToAnthropic(body, isOAuth) {
     content: typeof m.content === 'string' ? m.content : m.content,
   }));
 
-  if (payload.temperature !== undefined) result.temperature = payload.temperature;
-  if (payload.top_p !== undefined) result.top_p = payload.top_p;
+  // NOTE: temperature, top_p, presence_penalty, frequency_penalty were already stripped
+  // above. Do NOT add them back — Anthropic messages endpoint rejects them.
+  // stop → stop_sequences is the only valid mapping
   if (payload.stop !== undefined) result.stop_sequences = Array.isArray(payload.stop) ? payload.stop : [payload.stop];
 
   return JSON.stringify(result);
