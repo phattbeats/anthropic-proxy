@@ -332,6 +332,13 @@ const handler = (req, res) => {
         bodyBuf = Buffer.from(JSON.stringify(parsed));
       } catch (e) {}
 
+      // Strip temperature/top_p for /v1/messages passthrough too (LiteLLM may send here)
+      if (parsed) {
+        delete parsed.temperature;
+        delete parsed.top_p;
+        bodyBuf = Buffer.from(JSON.stringify(parsed));
+        console.log(`[PROXY] Stripped temperature/top_p from /v1/messages passthrough`);
+      }
       const isStream = !!(parsed && parsed.stream);
       if (!isStream) headers['content-length'] = String(bodyBuf.length);
       forwardToAnthropic('/v1/messages', 'POST', headers, bodyBuf, res, isStream);
