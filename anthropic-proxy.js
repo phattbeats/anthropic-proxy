@@ -68,7 +68,9 @@ function openAIToAnthropic(body, isOAuth) {
   for (const p of STRIP_PARAMS) delete payload[p];
 
   // Strip temperature only for models that reject it
-  if (payload.model && MODELS_NO_TEMPERATURE.includes(payload.model)) {
+  // Normalize model name: "anthropic/claude-opus-4-7" → "claude-opus-4-7" for comparison
+  const modelShort = payload.model ? payload.model.replace(/^anthropic\//, '') : null;
+  if (modelShort && MODELS_NO_TEMPERATURE.includes(modelShort)) {
     delete payload.temperature;
   }
 
