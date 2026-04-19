@@ -53,14 +53,27 @@ function modelsResponse() {
   });
 }
 
+// Parameters SillyTavern sends that Anthropic doesn't support — strip them
+const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'seed', 'response_format', 'function_call', 'functions'];
+
 // Convert OpenAI chat/completions format to Anthropic messages format
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
+
+  // Strip ALL OpenAI-specific params that don't exist in Anthropic /v1/messages
+  // OpenAI supports many params Anthropic doesn't: temperature, top_p, etc.
+  for (const p of STRIP_PARAMS) delete payload[p];
+  delete payload.temperature;    // Not supported by Anthropic messages endpoint
+  delete payload.top_p;             // Not supported by Anthropic messages endpoint
+
   const result = {
     model: payload.model,
     max_tokens: payload.max_tokens || 4096,
     stream: payload.stream || false,
   };
+
+  console.log(`[PROXY] Stripped payload: model=${payload.model}, temp=${payload.temperature}, top_p=${payload.top_p}`);
+  console.log(`[PROXY] Outbound result: model=${result.model}, temp=${result.temperature}`);
 
   // Extract system messages
   const systemMessages = (payload.messages || []).filter(m => m.role === 'system');
@@ -83,8 +96,9 @@ function openAIToAnthropic(body, isOAuth) {
     content: typeof m.content === 'string' ? m.content : m.content,
   }));
 
-  if (payload.temperature !== undefined) result.temperature = payload.temperature;
-  if (payload.top_p !== undefined) result.top_p = payload.top_p;
+  // NOTE: temperature, top_p, presence_penalty, frequency_penalty were already stripped
+  // above. Do NOT add them back — Anthropic messages endpoint rejects them.
+  // stop → stop_sequences is the only valid mapping
   if (payload.stop !== undefined) result.stop_sequences = Array.isArray(payload.stop) ? payload.stop : [payload.stop];
 
   return JSON.stringify(result);
@@ -318,6 +332,13 @@ const handler = (req, res) => {
         bodyBuf = Buffer.from(JSON.stringify(parsed));
       } catch (e) {}
 
+      // Strip temperature/top_p for /v1/messages passthrough too (LiteLLM may send here)
+      if (parsed) {
+        delete parsed.temperature;
+        delete parsed.top_p;
+        bodyBuf = Buffer.from(JSON.stringify(parsed));
+        console.log(`[PROXY] Stripped temperature/top_p from /v1/messages passthrough`);
+      }
       const isStream = !!(parsed && parsed.stream);
       if (!isStream) headers['content-length'] = String(bodyBuf.length);
       forwardToAnthropic('/v1/messages', 'POST', headers, bodyBuf, res, isStream);
