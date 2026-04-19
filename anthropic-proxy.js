@@ -72,6 +72,9 @@ function openAIToAnthropic(body, isOAuth) {
     stream: payload.stream || false,
   };
 
+  console.log(`[PROXY] Stripped payload: model=${payload.model}, temp=${payload.temperature}, top_p=${payload.top_p}`);
+  console.log(`[PROXY] Outbound result: model=${result.model}, temp=${result.temperature}`);
+
   // Extract system messages
   const systemMessages = (payload.messages || []).filter(m => m.role === 'system');
   const chatMessages = (payload.messages || []).filter(m => m.role !== 'system');
