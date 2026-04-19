@@ -53,9 +53,16 @@ function modelsResponse() {
   });
 }
 
+// Parameters SillyTavern sends that Anthropic doesn't support — strip them
+const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'seed', 'response_format', 'function_call', 'functions'];
+
 // Convert OpenAI chat/completions format to Anthropic messages format
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
+
+  // Strip unsupported OpenAI parameters before conversion
+  for (const p of STRIP_PARAMS) delete payload[p];
+
   const result = {
     model: payload.model,
     max_tokens: payload.max_tokens || 4096,
