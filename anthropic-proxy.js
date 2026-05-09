@@ -97,9 +97,6 @@ function openAIToAnthropic(body, isOAuth) {
     stream: payload.stream || false,
   };
 
-  console.log(`[PROXY] Stripped payload: model=${payload.model}, temp=${payload.temperature}, top_p=${payload.top_p}`);
-  console.log(`[PROXY] Outbound result: model=${result.model}, temp=${result.temperature}`);
-
   // Extract system messages
   const systemMessages = (payload.messages || []).filter(m => m.role === 'system');
   const chatMessages = (payload.messages || []).filter(m => m.role !== 'system');
@@ -228,6 +225,12 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
         'Content-Type': proxyRes.headers['content-type'] || 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+      });
+      // Guard against upstream connection drops mid-stream — without this the
+      // proxyRes 'error' event is uncaught and crashes the process.
+      proxyRes.on('error', e => {
+        console.error(`[PROXY] SSE upstream error: ${e.message}`);
+        try { res.end(); } catch (_) {}
       });
       proxyRes.pipe(res);
     } else {
