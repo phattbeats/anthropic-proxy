@@ -26,14 +26,16 @@ const USE_HTTPS = fs.existsSync(path.join(PROXY_DIR, 'proxy-key.pem'));
 const PROXY_MODE = (process.env.PROXY_MODE || 'regular').toLowerCase();
 const BILLING_MODE = PROXY_MODE === 'billing';
 const billing = BILLING_MODE ? require('./billing-mode') : null;
-let billingOAuth = null;
+// Stored OAuth token is optional in billing mode — if the client passes one in
+// the Authorization header / x-api-key, we use that instead. Only fall back to
+// stored creds when the client did not send a token.
+let billingOAuthFallback = null;
 if (BILLING_MODE) {
   try {
-    billingOAuth = billing.loadOAuthToken();
-    console.log(`[PROXY] Billing mode enabled. Subscription: ${billingOAuth.subscriptionType}`);
+    billingOAuthFallback = billing.loadOAuthToken();
+    console.log(`[PROXY] Billing mode enabled. Stored token subscription: ${billingOAuthFallback.subscriptionType}`);
   } catch (e) {
-    console.error(`[PROXY] FATAL: PROXY_MODE=billing but ${e.message}`);
-    process.exit(1);
+    console.log(`[PROXY] Billing mode enabled. No stored token (${e.message}); will use client-provided OAuth tokens.`);
   }
 }
 
@@ -262,14 +264,49 @@ const handler = (req, res) => {
       return res.end(modelsResponse());
     }
 
+    // Health check endpoint (must be before auth so it works without a token)
+    if (req.url === '/health' || req.url === '/v1/health') {
+      const health = {
+        status: 'ok',
+        proxy: 'anthropic-oauth-proxy',
+        version: '2.1',
+        mode: BILLING_MODE ? 'billing' : 'regular',
+        timestamp: new Date().toISOString(),
+        usage: { totalReq, totalIn, totalOut },
+      };
+      if (BILLING_MODE) {
+        health.ccVersionEmulated = billing.CC_VERSION;
+        health.tokenSource = billingOAuthFallback ? 'stored+client' : 'client-only';
+        if (billingOAuthFallback) {
+          const expiresIn = (billingOAuthFallback.expiresAt - Date.now()) / 3600000;
+          health.storedSubscription = billingOAuthFallback.subscriptionType;
+          health.storedTokenExpiresInHours = isFinite(expiresIn) ? expiresIn.toFixed(1) : 'env-var';
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(health));
+    }
+
     const apiKey = getApiKey(req.headers);
-    const isOAuth = apiKey.startsWith(OAUTH_PREFIX) || BILLING_MODE;
+    const clientHasOAuth = apiKey.startsWith(OAUTH_PREFIX);
+    const isOAuth = clientHasOAuth || BILLING_MODE;
+
+    // Pick the OAuth token to use in billing mode: prefer client-provided,
+    // fall back to proxy-stored. Returns null if neither is available.
+    const billingTokenSource = BILLING_MODE
+      ? (clientHasOAuth ? { accessToken: apiKey, source: 'client' }
+        : (billingOAuthFallback ? { accessToken: billingOAuthFallback.accessToken, source: 'stored' }
+          : null))
+      : null;
 
     // Build outbound headers
     const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
     if (BILLING_MODE) {
-      // Billing mode: proxy uses its own stored OAuth token + Stainless headers
-      Object.assign(headers, billing.buildBillingHeaders(billingOAuth.accessToken, req.headers));
+      if (!billingTokenSource) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'billing mode requires an OAuth token: send sk-ant-oat... via Authorization header, or set OAUTH_TOKEN env on the proxy' }));
+      }
+      Object.assign(headers, billing.buildBillingHeaders(billingTokenSource.accessToken, req.headers));
     } else if (isOAuth) {
       headers['authorization'] = `Bearer ${apiKey}`;
       Object.assign(headers, OAUTH_HEADERS);
@@ -496,26 +533,6 @@ const handler = (req, res) => {
       return;
     }
 
-    // Health check endpoint
-    if (req.url === '/health' || req.url === '/v1/health') {
-      const health = {
-        status: 'ok',
-        proxy: 'anthropic-oauth-proxy',
-        version: '2.1',
-        mode: BILLING_MODE ? 'billing' : 'regular',
-        timestamp: new Date().toISOString(),
-        usage: { totalReq, totalIn, totalOut },
-      };
-      if (BILLING_MODE && billingOAuth) {
-        const expiresIn = (billingOAuth.expiresAt - Date.now()) / 3600000;
-        health.subscription = billingOAuth.subscriptionType;
-        health.tokenExpiresInHours = isFinite(expiresIn) ? expiresIn.toFixed(1) : 'env-var';
-        health.ccVersionEmulated = billing.CC_VERSION;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(health));
-    }
-
     // Anything else — passthrough
     console.log(`[PROXY] Passthrough ${req.method} ${req.url}`);
     headers['content-length'] = String(rawBody.length);
@@ -538,7 +555,12 @@ server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
   console.log(`[PROXY] Anthropic OAuth proxy v2.1 listening on :${PORT} (${proto.toUpperCase()})`);
   console.log(`[PROXY] Mode: ${BILLING_MODE ? 'BILLING (subscription routing, full evasion)' : 'REGULAR (client-provided OAuth)'}`);
-  if (BILLING_MODE) console.log(`[PROXY] Subscription: ${billingOAuth.subscriptionType}, emulating CC v${billing.CC_VERSION}`);
+  if (BILLING_MODE) {
+    const src = billingOAuthFallback
+      ? `stored fallback (${billingOAuthFallback.subscriptionType}) + client-provided`
+      : 'client-provided only';
+    console.log(`[PROXY] Token source: ${src}, emulating CC v${billing.CC_VERSION}`);
+  }
   console.log(`[PROXY] Endpoints: /health, /v1/models, /v1/chat/completions, /v1/messages`);
   console.log(`[PROXY] Point SillyTavern/LiteLLM at: ${proto}://<host>:${PORT}`);
 });
