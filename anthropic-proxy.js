@@ -1,9 +1,18 @@
 #!/usr/bin/env node
 // Thin proxy: fixes OAuth token handling for Anthropic API
-// - Serves /v1/models for SillyTavern model discovery
-// - Translates /v1/chat/completions (OpenAI) → /v1/messages (Anthropic)
-// - Moves sk-ant-oat tokens from x-api-key to Authorization: Bearer
-// - Injects required OAuth headers + Claude Code system prompt
+//
+// Modes (set via PROXY_MODE env var):
+//   regular (default) — Client passes its own token; proxy fixes OAuth headers,
+//                       injects Claude Code system prompt, and handles
+//                       OpenAI ↔ Anthropic translation.
+//   billing           — Proxy stores its own Claude Code OAuth token (via
+//                       OAUTH_TOKEN env or ~/.claude/.credentials.json) and
+//                       runs full subscription-billing evasion (8 layers of
+//                       request transformation + reverse mapping). Client
+//                       does not need to send a token.
+//
+// Both modes log token usage per request.
+//
 // Usage: node anthropic-proxy.js [port]
 
 const http = require('http');
@@ -11,10 +20,24 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const PROXY_DIR = path.dirname(process.argv[1]);
+const PROXY_DIR = __dirname;
 const USE_HTTPS = fs.existsSync(path.join(PROXY_DIR, 'proxy-key.pem'));
 
-const PORT = parseInt(process.argv[2] || '4010');
+const PROXY_MODE = (process.env.PROXY_MODE || 'regular').toLowerCase();
+const BILLING_MODE = PROXY_MODE === 'billing';
+const billing = BILLING_MODE ? require('./billing-mode') : null;
+let billingOAuth = null;
+if (BILLING_MODE) {
+  try {
+    billingOAuth = billing.loadOAuthToken();
+    console.log(`[PROXY] Billing mode enabled. Subscription: ${billingOAuth.subscriptionType}`);
+  } catch (e) {
+    console.error(`[PROXY] FATAL: PROXY_MODE=billing but ${e.message}`);
+    process.exit(1);
+  }
+}
+
+const PORT = parseInt(process.argv[2] || process.env.PROXY_PORT || '4010');
 const TARGET = 'api.anthropic.com';
 const OAUTH_PREFIX = 'sk-ant-oat';
 const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -140,6 +163,53 @@ function getApiKey(headers) {
   return headers['x-api-key'] || '';
 }
 
+let totalReq = 0;
+let totalIn = 0;
+let totalOut = 0;
+function logUsage(model, input, output) {
+  totalReq++;
+  totalIn += input || 0;
+  totalOut += output || 0;
+  console.log(`[USAGE] model=${model} in=${input || 0} out=${output || 0} | totals: req=${totalReq} in=${totalIn} out=${totalOut}`);
+}
+function logUsageFromAnthropic(raw, model) {
+  try {
+    const r = JSON.parse(raw);
+    if (r.usage) logUsage(r.model || model, r.usage.input_tokens, r.usage.output_tokens);
+  } catch (e) {}
+}
+// Track usage from SSE message_delta events.
+function makeSSEUsageWatcher(model) {
+  let buffer = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let logged = false;
+  return {
+    feed(chunk) {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const ev = JSON.parse(line.slice(6).trim());
+          if (ev.type === 'message_start' && ev.message?.usage?.input_tokens) {
+            inputTokens = ev.message.usage.input_tokens;
+          } else if (ev.type === 'message_delta' && ev.usage?.output_tokens) {
+            outputTokens = ev.usage.output_tokens;
+          }
+        } catch (e) {}
+      }
+    },
+    flush() {
+      if (!logged && (inputTokens || outputTokens)) {
+        logUsage(model, inputTokens, outputTokens);
+        logged = true;
+      }
+    },
+  };
+}
+
 function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
   const options = {
     hostname: TARGET,
@@ -193,11 +263,14 @@ const handler = (req, res) => {
     }
 
     const apiKey = getApiKey(req.headers);
-    const isOAuth = apiKey.startsWith(OAUTH_PREFIX);
+    const isOAuth = apiKey.startsWith(OAUTH_PREFIX) || BILLING_MODE;
 
     // Build outbound headers
     const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
-    if (isOAuth) {
+    if (BILLING_MODE) {
+      // Billing mode: proxy uses its own stored OAuth token + Stainless headers
+      Object.assign(headers, billing.buildBillingHeaders(billingOAuth.accessToken, req.headers));
+    } else if (isOAuth) {
       headers['authorization'] = `Bearer ${apiKey}`;
       Object.assign(headers, OAUTH_HEADERS);
     } else {
@@ -206,7 +279,7 @@ const handler = (req, res) => {
 
     // OpenAI chat completions → Anthropic messages
     if (req.url === '/v1/chat/completions') {
-      console.log(`[PROXY] chat/completions → /v1/messages (OAuth: ${isOAuth})`);
+      console.log(`[PROXY] chat/completions → /v1/messages (mode: ${BILLING_MODE ? 'billing' : 'regular'}, OAuth: ${isOAuth})`);
       let bodyStr;
       try {
         bodyStr = openAIToAnthropic(rawBody.toString(), isOAuth);
@@ -214,6 +287,8 @@ const handler = (req, res) => {
         res.writeHead(400);
         return res.end(JSON.stringify({ error: 'Bad request body: ' + e.message }));
       }
+      // In billing mode, run the body through the 8-layer transformer
+      if (BILLING_MODE) bodyStr = billing.processBody(bodyStr);
       const bodyBuf = Buffer.from(bodyStr);
       headers['content-length'] = String(bodyBuf.length);
 
@@ -232,31 +307,34 @@ const handler = (req, res) => {
             'Connection': 'keep-alive',
           });
           let buffer = '';
-          proxyRes.on('data', chunk => {
-            buffer += chunk.toString();
+          let inputTokens = 0;
+          let outputTokens = 0;
+          // In billing mode, reverse-map each SSE event before re-parsing.
+          const xform = BILLING_MODE ? billing.createSSETransformer() : null;
+          const handleLines = (text) => {
+            buffer += text;
             const lines = buffer.split('\n');
-            buffer = lines.pop(); // keep incomplete line
+            buffer = lines.pop();
             for (const line of lines) {
               if (line.startsWith('data: ')) {
                 const data = line.slice(6).trim();
                 if (data === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
                 try {
                   const ev = JSON.parse(data);
-                  // Anthropic → OpenAI SSE chunk
+                  if (ev.type === 'message_start' && ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
+                  if (ev.type === 'message_delta' && ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
                   if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
-                    const chunk = {
+                    res.write(`data: ${JSON.stringify({
                       id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
-                      choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }]
-                    };
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                      choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }],
+                    })}\n\n`);
                   } else if (ev.type === 'message_delta' && ev.delta?.stop_reason) {
-                    const chunk = {
+                    res.write(`data: ${JSON.stringify({
                       id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
-                      choices: [{ index: 0, delta: {}, finish_reason: ev.delta.stop_reason === 'end_turn' ? 'stop' : ev.delta.stop_reason }]
-                    };
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                      choices: [{ index: 0, delta: {}, finish_reason: ev.delta.stop_reason === 'end_turn' ? 'stop' : ev.delta.stop_reason }],
+                    })}\n\n`);
                     res.write('data: [DONE]\n\n');
                   }
                 } catch(e) {}
@@ -264,13 +342,27 @@ const handler = (req, res) => {
                 res.write(line + '\n');
               }
             }
+          };
+          proxyRes.on('data', chunk => {
+            const text = xform ? xform.onData(chunk) : chunk.toString();
+            if (text) handleLines(text);
           });
-          proxyRes.on('end', () => res.end());
+          proxyRes.on('end', () => {
+            if (xform) {
+              const tail = xform.onEnd();
+              if (tail) handleLines(tail);
+            }
+            if (inputTokens || outputTokens) logUsage(model, inputTokens, outputTokens);
+            res.end();
+          });
         } else {
           let respChunks = [];
           proxyRes.on('data', c => respChunks.push(c));
           proxyRes.on('end', () => {
-            const raw = Buffer.concat(respChunks).toString();
+            let buf = Buffer.concat(respChunks);
+            if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
+            const raw = buf.toString();
+            logUsageFromAnthropic(raw, model);
             const converted = anthropicToOpenAI(raw, model, false);
             res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
             res.end(converted);
@@ -285,13 +377,32 @@ const handler = (req, res) => {
 
     // Native /v1/messages passthrough with OAuth fix
     if (req.url.startsWith('/v1/messages')) {
-      console.log(`[PROXY] /v1/messages passthrough (OAuth: ${isOAuth})`);
+      console.log(`[PROXY] /v1/messages passthrough (mode: ${BILLING_MODE ? 'billing' : 'regular'}, OAuth: ${isOAuth})`);
       let bodyBuf = rawBody;
       let parsed = null;
+      let model = 'unknown';
+      let isStream = false;
+
       try {
         parsed = JSON.parse(rawBody.toString());
+        model = parsed?.model || model;
+        isStream = !!parsed?.stream;
+        // Strip params Anthropic /v1/messages doesn't accept (LiteLLM/SillyTavern often send these)
+        if (parsed) {
+          for (const p of STRIP_PARAMS) delete parsed[p];
+          delete parsed.temperature;
+          delete parsed.top_p;
+        }
+      } catch (e) {}
 
-        // Always ensure Claude Code system prompt is first for OAuth tokens
+      // Source-of-truth body string for either mode (after param strip)
+      const sourceBodyStr = parsed ? JSON.stringify(parsed) : rawBody.toString();
+
+      if (BILLING_MODE) {
+        // Billing mode: run full request transformation pipeline (8 layers)
+        bodyBuf = Buffer.from(billing.processBody(sourceBodyStr));
+      } else if (parsed) {
+        // Regular mode: inject Claude Code system prompt for OAuth + cap cache_control
         if (isOAuth) {
           if (!parsed.system || (Array.isArray(parsed.system) && parsed.system.length === 0)) {
             parsed.system = [{ type: 'text', text: CLAUDE_CODE_SYSTEM }];
@@ -299,12 +410,9 @@ const handler = (req, res) => {
             const hasCC = parsed.system.some(b => b.text === CLAUDE_CODE_SYSTEM);
             if (!hasCC) parsed.system.unshift({ type: 'text', text: CLAUDE_CODE_SYSTEM });
           } else if (typeof parsed.system === 'string') {
-            // Convert string system to array with CC prompt first
             parsed.system = [{ type: 'text', text: CLAUDE_CODE_SYSTEM }, { type: 'text', text: parsed.system }];
           }
         }
-
-        // Cap cache_control blocks to 4 max (Anthropic hard limit)
         let cacheCount = 0;
         const stripExcessCache = (blocks) => {
           if (!Array.isArray(blocks)) return blocks;
@@ -319,7 +427,6 @@ const handler = (req, res) => {
             return b;
           });
         };
-
         if (Array.isArray(parsed.system)) parsed.system = stripExcessCache(parsed.system);
         if (Array.isArray(parsed.messages)) {
           parsed.messages = parsed.messages.map(m => {
@@ -327,33 +434,86 @@ const handler = (req, res) => {
             return m;
           });
         }
-
         if (cacheCount > 4) console.log(`[PROXY] Stripped ${cacheCount - 4} excess cache_control blocks`);
         bodyBuf = Buffer.from(JSON.stringify(parsed));
-      } catch (e) {}
-
-      // Strip temperature/top_p for /v1/messages passthrough too (LiteLLM may send here)
-      if (parsed) {
-        delete parsed.temperature;
-        delete parsed.top_p;
-        bodyBuf = Buffer.from(JSON.stringify(parsed));
-        console.log(`[PROXY] Stripped temperature/top_p from /v1/messages passthrough`);
       }
-      const isStream = !!(parsed && parsed.stream);
+
       if (!isStream) headers['content-length'] = String(bodyBuf.length);
-      forwardToAnthropic('/v1/messages', 'POST', headers, bodyBuf, res, isStream);
+
+      // In billing mode we need to apply reverseMap to the response body / SSE stream.
+      // In regular mode we passthrough and just log usage.
+      const upstreamReq = https.request({
+        hostname: TARGET, port: 443, path: '/v1/messages', method: 'POST', headers,
+      }, upRes => {
+        if (isStream) {
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];
+          delete sseHeaders['transfer-encoding'];
+          res.writeHead(upRes.statusCode, sseHeaders);
+          const usageWatcher = makeSSEUsageWatcher(model);
+          if (BILLING_MODE) {
+            const xform = billing.createSSETransformer();
+            upRes.on('data', chunk => {
+              usageWatcher.feed(chunk);
+              const out = xform.onData(chunk);
+              if (out) res.write(out);
+            });
+            upRes.on('end', () => {
+              const tail = xform.onEnd();
+              if (tail) res.write(tail);
+              usageWatcher.flush();
+              res.end();
+            });
+          } else {
+            upRes.on('data', chunk => { usageWatcher.feed(chunk); res.write(chunk); });
+            upRes.on('end', () => { usageWatcher.flush(); res.end(); });
+          }
+        } else {
+          let respChunks = [];
+          upRes.on('data', c => respChunks.push(c));
+          upRes.on('end', () => {
+            let buf = Buffer.concat(respChunks);
+            if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
+            const raw = buf.toString();
+            logUsageFromAnthropic(raw, model);
+            const nh = { ...upRes.headers };
+            delete nh['transfer-encoding'];
+            nh['content-length'] = Buffer.byteLength(buf);
+            res.writeHead(upRes.statusCode, nh);
+            res.end(buf);
+          });
+        }
+      });
+      upstreamReq.on('error', e => {
+        console.error(`[PROXY] /v1/messages upstream error: ${e.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      upstreamReq.write(bodyBuf);
+      upstreamReq.end();
       return;
     }
 
     // Health check endpoint
     if (req.url === '/health' || req.url === '/v1/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
+      const health = {
         status: 'ok',
         proxy: 'anthropic-oauth-proxy',
-        version: '2.0',
+        version: '2.1',
+        mode: BILLING_MODE ? 'billing' : 'regular',
         timestamp: new Date().toISOString(),
-      }));
+        usage: { totalReq, totalIn, totalOut },
+      };
+      if (BILLING_MODE && billingOAuth) {
+        const expiresIn = (billingOAuth.expiresAt - Date.now()) / 3600000;
+        health.subscription = billingOAuth.subscriptionType;
+        health.tokenExpiresInHours = isFinite(expiresIn) ? expiresIn.toFixed(1) : 'env-var';
+        health.ccVersionEmulated = billing.CC_VERSION;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(health));
     }
 
     // Anything else — passthrough
@@ -376,7 +536,9 @@ if (USE_HTTPS) {
 
 server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
-  console.log(`[PROXY] Anthropic OAuth proxy v2 listening on :${PORT} (${proto.toUpperCase()})`);
+  console.log(`[PROXY] Anthropic OAuth proxy v2.1 listening on :${PORT} (${proto.toUpperCase()})`);
+  console.log(`[PROXY] Mode: ${BILLING_MODE ? 'BILLING (subscription routing, full evasion)' : 'REGULAR (client-provided OAuth)'}`);
+  if (BILLING_MODE) console.log(`[PROXY] Subscription: ${billingOAuth.subscriptionType}, emulating CC v${billing.CC_VERSION}`);
   console.log(`[PROXY] Endpoints: /health, /v1/models, /v1/chat/completions, /v1/messages`);
-  console.log(`[PROXY] Point SillyTavern/LiteLLM at: ${proto}://172.18.0.27:${PORT}`);
+  console.log(`[PROXY] Point SillyTavern/LiteLLM at: ${proto}://<host>:${PORT}`);
 });
