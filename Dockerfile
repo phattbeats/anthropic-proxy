@@ -1,6 +1,6 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY anthropic-proxy.js .
+COPY anthropic-proxy.js billing-mode.js ./
 EXPOSE 4010
 
 # Health check — the /health endpoint is already implemented in the proxy
