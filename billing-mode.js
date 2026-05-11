@@ -233,11 +233,12 @@ function processBody(bodyStr) {
   if (configStart !== -1) {
     let stripFrom = configStart;
     if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') stripFrom -= 2;
-    // End at the first markdown H2 section break after the identity marker.
-    // Previously this required `\n## /` or `\n## C:\\` (paths from the
-    // OpenClaw workspace template) — too brittle if that format ever changes.
-    // Any H2 break is still bounded by the strippedLen > 1000 guard below.
-    const configEnd = m.indexOf('\\n## ', configStart + IDENTITY_MARKER.length);
+    // End at the first workspace-doc header (filesystem path H2). The config
+    // block itself contains H2 sub-sections (`## Tooling`, `## Workspace`,
+    // `## Messaging`) so a generic `\n## ` match would terminate too early.
+    // Matches upstream zacdcook/openclaw-billing-proxy v2.2.4 (closes #26).
+    let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
+    if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
     if (configEnd !== -1) {
       const strippedLen = configEnd - stripFrom;
       if (strippedLen > 1000) {
