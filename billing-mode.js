@@ -13,8 +13,11 @@ const { StringDecoder } = require('string_decoder');
 const CC_VERSION = '2.1.97';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
-const DEVICE_ID = crypto.randomBytes(32).toString('hex');
-const INSTANCE_SESSION_ID = crypto.randomUUID();
+// DEVICE_ID and INSTANCE_SESSION_ID stay stable across container restarts only
+// if pinned via env. Otherwise each startup looks like a fresh device, which
+// hurts billing fingerprint continuity (not correctness).
+const DEVICE_ID = process.env.DEVICE_ID || crypto.randomBytes(32).toString('hex');
+const INSTANCE_SESSION_ID = process.env.INSTANCE_SESSION_ID || crypto.randomUUID();
 
 const REQUIRED_BETAS = [
   'oauth-2025-04-20',
@@ -230,8 +233,11 @@ function processBody(bodyStr) {
   if (configStart !== -1) {
     let stripFrom = configStart;
     if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') stripFrom -= 2;
-    let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
-    if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
+    // End at the first markdown H2 section break after the identity marker.
+    // Previously this required `\n## /` or `\n## C:\\` (paths from the
+    // OpenClaw workspace template) — too brittle if that format ever changes.
+    // Any H2 break is still bounded by the strippedLen > 1000 guard below.
+    const configEnd = m.indexOf('\\n## ', configStart + IDENTITY_MARKER.length);
     if (configEnd !== -1) {
       const strippedLen = configEnd - stripFrom;
       if (strippedLen > 1000) {
