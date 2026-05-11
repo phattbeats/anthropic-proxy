@@ -97,9 +97,6 @@ function openAIToAnthropic(body, isOAuth) {
     stream: payload.stream || false,
   };
 
-  console.log(`[PROXY] Stripped payload: model=${payload.model}, temp=${payload.temperature}, top_p=${payload.top_p}`);
-  console.log(`[PROXY] Outbound result: model=${result.model}, temp=${result.temperature}`);
-
   // Extract system messages
   const systemMessages = (payload.messages || []).filter(m => m.role === 'system');
   const chatMessages = (payload.messages || []).filter(m => m.role !== 'system');
@@ -229,6 +226,13 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
       });
+      // Guard against upstream connection drops mid-stream — without this the
+      // proxyRes 'error' event is uncaught and crashes the process.
+      proxyRes.on('error', e => {
+        console.error(`[PROXY] upstream SSE error: ${e.message}`);
+        if (!res.headersSent) { res.writeHead(502); res.end(JSON.stringify({ error: e.message })); }
+        else if (res.writable) res.end();
+      });
       proxyRes.pipe(res);
     } else {
       let chunks = [];
@@ -243,8 +247,12 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
 
   proxyReq.on('error', e => {
     console.error(`[PROXY] Error: ${e.message}`);
-    res.writeHead(502);
-    res.end(JSON.stringify({ error: e.message }));
+    if (!res.headersSent) {
+      res.writeHead(502);
+      res.end(JSON.stringify({ error: e.message }));
+    } else if (res.writable) {
+      res.end();
+    }
   });
 
   if (body && body.length > 0) proxyReq.write(body);
@@ -392,6 +400,11 @@ const handler = (req, res) => {
             if (inputTokens || outputTokens) logUsage(model, inputTokens, outputTokens);
             res.end();
           });
+          // Guard against upstream connection drops mid-stream.
+          proxyRes.on('error', e => {
+            console.error(`[PROXY] SSE upstream error: ${e.message}`);
+            try { res.end(); } catch (_) {}
+          });
         } else {
           let respChunks = [];
           proxyRes.on('data', c => respChunks.push(c));
@@ -404,9 +417,22 @@ const handler = (req, res) => {
             res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
             res.end(converted);
           });
+          proxyRes.on('error', e => {
+            console.error(`[PROXY] chat/completions upstream error: ${e.message}`);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: e.message }));
+            } else if (res.writable) res.end();
+          });
         }
       });
-      proxyReq.on('error', e => { res.writeHead(502); res.end(JSON.stringify({ error: e.message })); });
+      proxyReq.on('error', e => {
+        console.error(`[PROXY] chat/completions request error: ${e.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        } else if (res.writable) res.end();
+      });
       proxyReq.write(bodyBuf);
       proxyReq.end();
       return;
@@ -505,6 +531,10 @@ const handler = (req, res) => {
             upRes.on('data', chunk => { usageWatcher.feed(chunk); res.write(chunk); });
             upRes.on('end', () => { usageWatcher.flush(); res.end(); });
           }
+          upRes.on('error', e => {
+            console.error(`[PROXY] /v1/messages SSE upstream error: ${e.message}`);
+            if (res.writable) res.end();
+          });
         } else {
           let respChunks = [];
           upRes.on('data', c => respChunks.push(c));
@@ -519,14 +549,21 @@ const handler = (req, res) => {
             res.writeHead(upRes.statusCode, nh);
             res.end(buf);
           });
+          upRes.on('error', e => {
+            console.error(`[PROXY] /v1/messages upstream error: ${e.message}`);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: e.message }));
+            } else if (res.writable) res.end();
+          });
         }
       });
       upstreamReq.on('error', e => {
-        console.error(`[PROXY] /v1/messages upstream error: ${e.message}`);
+        console.error(`[PROXY] /v1/messages request error: ${e.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: e.message }));
-        }
+        } else if (res.writable) res.end();
       });
       upstreamReq.write(bodyBuf);
       upstreamReq.end();
