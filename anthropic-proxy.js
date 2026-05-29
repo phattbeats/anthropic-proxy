@@ -52,7 +52,8 @@ const OAUTH_HEADERS = {
 };
 
 const MODELS = [
-  // Current shipping models (as of 2026-04)
+  // Current shipping models (as of 2026-05)
+  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
   { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
   { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
   { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
