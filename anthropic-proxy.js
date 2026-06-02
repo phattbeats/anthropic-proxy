@@ -51,6 +51,9 @@ const OAUTH_HEADERS = {
   'x-app': 'cli',
 };
 
+// Static fallback list — only used when the live Anthropic /v1/models endpoint
+// can't be reached (no token available, or upstream error). The proxy prefers
+// the live list so newly-released models appear automatically with no code edit.
 const MODELS = [
   // Current shipping models (as of 2026-05)
   { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
@@ -66,8 +69,8 @@ const MODELS = [
   { id: 'claude-haiku-3', name: 'Claude Haiku 3 (legacy)' },
 ];
 
-function modelsResponse() {
-  return JSON.stringify({
+function staticModelsList() {
+  return {
     object: 'list',
     data: MODELS.map(m => ({
       id: m.id,
@@ -76,7 +79,73 @@ function modelsResponse() {
       owned_by: 'anthropic',
       display_name: m.name,
     }))
+  };
+}
+
+// Cache the live model list so we don't hit Anthropic on every GET /v1/models
+// (SillyTavern/LiteLLM poll this frequently). TTL is short so a freshly-released
+// model shows up within a few minutes without a restart.
+let modelCache = { data: null, fetchedAt: 0 };
+const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// Build the auth headers needed to call Anthropic's GET /v1/models on behalf of
+// the request. Returns null when no usable token is available (the caller then
+// falls back to the cached or static list).
+function buildModelFetchHeaders(reqHeaders) {
+  const apiKey = getApiKey(reqHeaders);
+  const clientHasOAuth = apiKey.startsWith(OAUTH_PREFIX);
+  if (BILLING_MODE) {
+    const token = clientHasOAuth ? apiKey
+      : (billingOAuthFallback ? billingOAuthFallback.accessToken : null);
+    if (!token) return null;
+    const headers = billing.buildBillingHeaders(token, reqHeaders);
+    delete headers['content-type'];
+    return headers;
+  }
+  const headers = { 'anthropic-version': '2023-06-01' };
+  if (clientHasOAuth) {
+    headers['authorization'] = `Bearer ${apiKey}`;
+    Object.assign(headers, OAUTH_HEADERS);
+  } else if (apiKey) {
+    headers['x-api-key'] = apiKey;
+  } else {
+    return null;
+  }
+  return headers;
+}
+
+// Fetch the live model list from Anthropic and normalize it to OpenAI shape.
+// cb(err, listObject). Anthropic returns { data: [{ type, id, display_name,
+// created_at }], has_more, ... } — we map id/display_name straight through so
+// whatever Anthropic ships is what clients see.
+function fetchUpstreamModels(authHeaders, cb) {
+  const upReq = https.request({
+    hostname: TARGET, port: 443, path: '/v1/models?limit=1000', method: 'GET', headers: authHeaders,
+  }, upRes => {
+    let chunks = [];
+    upRes.on('data', c => chunks.push(c));
+    upRes.on('end', () => {
+      if (upRes.statusCode !== 200) {
+        return cb(new Error(`upstream /v1/models returned ${upRes.statusCode}`));
+      }
+      try {
+        const r = JSON.parse(Buffer.concat(chunks).toString());
+        if (!Array.isArray(r.data)) return cb(new Error('unexpected upstream /v1/models body'));
+        cb(null, {
+          object: 'list',
+          data: r.data.map(m => ({
+            id: m.id,
+            object: 'model',
+            created: m.created_at ? Math.floor(new Date(m.created_at).getTime() / 1000) : 1700000000,
+            owned_by: 'anthropic',
+            display_name: m.display_name || m.id,
+          })),
+        });
+      } catch (e) { cb(e); }
+    });
   });
+  upReq.on('error', cb);
+  upReq.end();
 }
 
 // Parameters SillyTavern sends that Anthropic doesn't support — strip them
@@ -266,11 +335,32 @@ const handler = (req, res) => {
   req.on('end', () => {
     const rawBody = Buffer.concat(chunks);
 
-    // Model list endpoint
+    // Model list endpoint — serve the LIVE Anthropic model list so newly
+    // released models appear automatically. Cache briefly; fall back to the
+    // static list when no token is available or upstream fails.
     if (req.url === '/v1/models' || req.url === '/v1/models/') {
-      console.log(`[PROXY] GET /v1/models`);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(modelsResponse());
+      const sendList = (list, source) => {
+        console.log(`[PROXY] GET /v1/models (${source}, ${list.data.length} models)`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(list));
+      };
+
+      if (modelCache.data && (Date.now() - modelCache.fetchedAt) < MODEL_CACHE_TTL_MS) {
+        return sendList(modelCache.data, 'cache');
+      }
+      const fetchHeaders = buildModelFetchHeaders(req.headers);
+      if (!fetchHeaders) {
+        return sendList(modelCache.data || staticModelsList(), modelCache.data ? 'cache' : 'static-no-token');
+      }
+      fetchUpstreamModels(fetchHeaders, (err, list) => {
+        if (err || !list) {
+          console.error(`[PROXY] live model fetch failed: ${err ? err.message : 'no data'}; serving ${modelCache.data ? 'stale cache' : 'static list'}`);
+          return sendList(modelCache.data || staticModelsList(), modelCache.data ? 'stale-cache' : 'static-fallback');
+        }
+        modelCache = { data: list, fetchedAt: Date.now() };
+        sendList(list, 'live');
+      });
+      return;
     }
 
     // Health check endpoint (must be before auth so it works without a token)
