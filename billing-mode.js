@@ -10,7 +10,13 @@ const os = require('os');
 const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 
-const CC_VERSION = '2.1.97';
+// Emulated Claude Code version. MUST track the real CLI version that interactive
+// sessions report — a stale value is a weak billing fingerprint. Override via the
+// CC_VERSION env at deploy time so it can be bumped without a code change when the
+// CLI updates (live harness CLI is 2.1.168 as of 2026-06). Only read in billing
+// mode (this file is require()'d only when PROXY_MODE=billing), so changing the
+// default has zero effect on regular-mode traffic.
+const CC_VERSION = process.env.CC_VERSION || '2.1.168';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 // DEVICE_ID and INSTANCE_SESSION_ID stay stable across container restarts only
