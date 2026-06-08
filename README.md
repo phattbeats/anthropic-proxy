@@ -7,6 +7,7 @@ Thin proxy that fixes OAuth token handling for Anthropic API. Two modes via `PRO
 - Injects required OAuth headers + Claude Code system prompt
 - Translates OpenAI `/v1/chat/completions` → Anthropic `/v1/messages`
 - Serves `/v1/models` for SillyTavern model discovery — fetched **live** from Anthropic (cached 5 min) so newly released models appear automatically; falls back to a built-in static list when no token is available or upstream is unreachable
+- `REGULAR_UA` (optional) — the `user-agent` presented to Anthropic. Defaults to the live CLI version (`claude-cli/2.1.168`, falls back to `CC_VERSION` if set), so the interactive fingerprint tracks the real CLI without a code edit. Override only if you need a specific UA. Behavior is otherwise unchanged.
 
 **Billing mode (`PROXY_MODE=billing`):** proxy stores its own Claude Code OAuth token and routes every request through your Claude subscription (instead of pay-per-token). Includes 8 layers of detection bypass adapted from [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy):
 - Billing fingerprint header injection (per-request SHA256)

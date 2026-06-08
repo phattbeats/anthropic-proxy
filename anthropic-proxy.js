@@ -44,10 +44,16 @@ const TARGET = 'api.anthropic.com';
 const OAUTH_PREFIX = 'sk-ant-oat';
 const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+// Regular-mode user-agent. Kept env-overridable (and defaulted to the live CLI
+// version) so it tracks the real Claude Code release without a code edit — a
+// stale UA is the weakest part of the interactive fingerprint. Same pattern as
+// billing mode's CC_VERSION. Behavior is unchanged; this is the UA string only.
+const REGULAR_UA = process.env.REGULAR_UA || `claude-cli/${process.env.CC_VERSION || '2.1.168'}`;
+
 const OAUTH_HEADERS = {
   'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14',
   'anthropic-dangerous-direct-browser-access': 'true',
-  'user-agent': 'claude-cli/2.1.75',
+  'user-agent': REGULAR_UA,
   'x-app': 'cli',
 };
 
