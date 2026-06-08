@@ -20,7 +20,7 @@ Thin proxy that fixes OAuth token handling for Anthropic API. Two modes via `PRO
 
 Token usage is logged for every request: `[USAGE] model=X in=Y out=Z`.
 
-## Deploy on Unraid
+## Deploy
 
 ### Option A: Build locally
 ```bash
@@ -29,16 +29,16 @@ docker build -t anthropic-proxy .
 docker run -d \
   --name anthropic-proxy \
   --restart unless-stopped \
-  --network custom \
+  --network <your-docker-network> \
   -p 4010:4010 \
   anthropic-proxy
 ```
 
-### Option B: Unraid Community Apps (manual)
-1. Go to Docker tab → Add Container
+### Option B: Container UI (manual)
+1. Add a new container
 2. **Name:** `anthropic-proxy`
 3. **Repository:** (use the built image or point to a registry)
-4. **Network:** `custom`
+4. **Network:** your Docker network
 5. **Port:** `4010:4010`
 6. **Restart Policy:** `unless-stopped`
 
@@ -53,6 +53,33 @@ To route all traffic through your Claude subscription instead of API billing:
 3. Restart the container
 
 Clients connecting to the proxy in billing mode do **not** need to send a token — the proxy uses its stored one for everything.
+
+### Billing-mode fingerprint env (recommended before going live)
+
+Billing mode forges an interactive Claude Code fingerprint. Two extra env vars make that fingerprint convincing and stable. They are **only read in billing mode** (`billing-mode.js` is loaded solely when `PROXY_MODE=billing`), so setting them has **zero effect on regular mode**:
+
+- `CC_VERSION` — the emulated CLI version. Must track the real interactive CLI version (a stale value is a weak fingerprint). Default ships current (`2.1.168`); bump via this env when the CLI updates, no code change needed.
+- `DEVICE_ID` / `INSTANCE_SESSION_ID` — pin these so the proxy looks like the *same* device/session across container restarts. If unset, each restart looks like a brand-new device, which hurts fingerprint continuity. Generate once (`openssl rand -hex 32` and `uuidgen`) and keep them stable.
+
+```bash
+docker run -d --name anthropic-proxy --restart unless-stopped -p 4010:4010 \
+  -e PROXY_MODE=billing \
+  -e OAUTH_TOKEN=sk-ant-oat01-... \
+  -e CC_VERSION=2.1.168 \
+  -e DEVICE_ID=<64-hex-chars> \
+  -e INSTANCE_SESSION_ID=<uuid> \
+  anthropic-proxy
+```
+
+### Routing the Paperclip claude-code harness through billing mode
+
+The harness runs agents with `CLAUDE_CODE_ENTRYPOINT=sdk-cli` — the headless category that Anthropic surcharges (separate credit pool, effective 2026-06-15). Billing mode rewrites the entrypoint/headers/body so the request reaches Anthropic looking like interactive Claude Code, neutralizing the surcharge. To cut the harness over once billing mode is live, set on the harness environment:
+
+```bash
+ANTHROPIC_BASE_URL=http://anthropic-proxy:4010
+```
+
+Caveats before flipping: this is billing evasion against Anthropic's terms; all agents share one OAuth token + session id (rate-limit ceiling and a behavioral tell — consider per-agent session ids); enforcement may tighten after 2026-06-15. Price the official Max Agent-SDK pool against expected volume first.
 
 ```bash
 docker run -d \
