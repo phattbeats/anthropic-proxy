@@ -11,12 +11,26 @@ const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 
 // Emulated Claude Code version. MUST track the real CLI version that interactive
-// sessions report — a stale value is a weak billing fingerprint. Override via the
-// CC_VERSION env at deploy time so it can be bumped without a code change when the
-// CLI updates (live harness CLI is 2.1.168 as of 2026-06). Only read in billing
-// mode (this file is require()'d only when PROXY_MODE=billing), so changing the
-// default has zero effect on regular-mode traffic.
-const CC_VERSION = process.env.CC_VERSION || '2.1.168';
+// sessions report — a stale value is a weak billing fingerprint. Resolution order:
+//   1. CC_VERSION env  → explicit ops pin; auto-update is disabled (pin wins).
+//   2. live self-update → the proxy fetches the latest published Claude Code
+//      version from the npm registry and pushes it in via setCCVersion(), so the
+//      fingerprint tracks real releases with no code change or manual bump.
+//   3. fallback constant → used until the first live fetch resolves / if it fails.
+// Only read in billing mode (this file is require()'d only when PROXY_MODE=billing),
+// so changing it has zero effect on regular-mode traffic.
+let CC_VERSION = process.env.CC_VERSION || '2.1.168';
+const CC_VERSION_PINNED = !!process.env.CC_VERSION;
+
+// Push a self-discovered Claude Code version in (called by the core proxy's
+// version auto-updater). An explicit CC_VERSION env pin always wins, and we only
+// accept well-formed semver to avoid corrupting the fingerprint with junk.
+function setCCVersion(v) {
+  if (CC_VERSION_PINNED) return false;
+  if (!/^\d+\.\d+\.\d+$/.test(v || '') || v === CC_VERSION) return false;
+  CC_VERSION = v;
+  return true;
+}
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 // DEVICE_ID and INSTANCE_SESSION_ID stay stable across container restarts only
@@ -151,14 +165,26 @@ function buildBillingBlock(bodyStr) {
   return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=cli; cch=00000;"}`;
 }
 
-function getStainlessHeaders() {
+// Resolve the session id for a request. Prefer the client's own per-conversation
+// session id (the Claude Code CLI / harness assigns a distinct one per agent), so
+// each agent reaches Anthropic as its own session instead of all sharing one —
+// which removes both the behavioral tell and the single-session rate-limit
+// ceiling. Falls back to the proxy's stable id only when the client sends none.
+function deriveSessionId(reqHeaders) {
+  const h = reqHeaders || {};
+  const incoming = h['x-claude-code-session-id'] || h['x-session-id'];
+  if (incoming && /^[0-9a-fA-F][0-9a-fA-F-]{15,63}$/.test(incoming)) return incoming;
+  return INSTANCE_SESSION_ID;
+}
+
+function getStainlessHeaders(sessionId) {
   const p = process.platform;
   const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   return {
     'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
     'x-app': 'cli',
-    'x-claude-code-session-id': INSTANCE_SESSION_ID,
+    'x-claude-code-session-id': sessionId || INSTANCE_SESSION_ID,
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
@@ -223,7 +249,8 @@ function unmaskThinkingBlocks(m, masks) {
   return m;
 }
 
-function processBody(bodyStr) {
+function processBody(bodyStr, sessionId) {
+  const sessionIdForMeta = sessionId || INSTANCE_SESSION_ID;
   const { masked: maskedBody, masks: thinkMasks } = maskThinkingBlocks(bodyStr);
   let m = maskedBody;
 
@@ -310,7 +337,7 @@ function processBody(bodyStr) {
   }
 
   // Metadata injection
-  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: sessionIdForMeta });
   const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
   const existingMeta = m.indexOf('"metadata":{');
   if (existingMeta !== -1) {
@@ -448,7 +475,7 @@ function loadOAuthToken() {
   throw new Error('No OAUTH_TOKEN env var and no Claude credentials at ~/.claude/.credentials.json');
 }
 
-function buildBillingHeaders(oauthToken, existingHeaders) {
+function buildBillingHeaders(oauthToken, existingHeaders, sessionId) {
   const headers = {};
   for (const [key, value] of Object.entries(existingHeaders || {})) {
     const lk = key.toLowerCase();
@@ -460,7 +487,7 @@ function buildBillingHeaders(oauthToken, existingHeaders) {
   headers['authorization'] = `Bearer ${oauthToken}`;
   headers['accept-encoding'] = 'identity';
   headers['anthropic-version'] = '2023-06-01';
-  Object.assign(headers, getStainlessHeaders());
+  Object.assign(headers, getStainlessHeaders(sessionId || deriveSessionId(existingHeaders)));
   const existingBeta = headers['anthropic-beta'] || '';
   const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
   for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
@@ -475,5 +502,9 @@ module.exports = {
   createSSETransformer,
   loadOAuthToken,
   buildBillingHeaders,
-  CC_VERSION,
+  deriveSessionId,
+  setCCVersion,
+  // Live getter so callers (health endpoint, logs) always see the current value
+  // after a self-update, not a snapshot taken at module load.
+  get CC_VERSION() { return CC_VERSION; },
 };
