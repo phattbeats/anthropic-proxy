@@ -54,21 +54,24 @@ To route all traffic through your Claude subscription instead of API billing:
 
 Clients connecting to the proxy in billing mode do **not** need to send a token — the proxy uses its stored one for everything.
 
-### Billing-mode fingerprint env (recommended before going live)
+### Billing-mode fingerprint (mostly self-maintaining)
 
-Billing mode forges an interactive Claude Code fingerprint. Two extra env vars make that fingerprint convincing and stable. They are **only read in billing mode** (`billing-mode.js` is loaded solely when `PROXY_MODE=billing`), so setting them has **zero effect on regular mode**:
+Billing mode forges an interactive Claude Code fingerprint. Two parts of that fingerprint now look after themselves, so the fingerprint stays convincing with no babysitting:
 
-- `CC_VERSION` — the emulated CLI version. Must track the real interactive CLI version (a stale value is a weak fingerprint). Default ships current (`2.1.168`); bump via this env when the CLI updates, no code change needed.
-- `DEVICE_ID` / `INSTANCE_SESSION_ID` — pin these so the proxy looks like the *same* device/session across container restarts. If unset, each restart looks like a brand-new device, which hurts fingerprint continuity. Generate once (`openssl rand -hex 32` and `uuidgen`) and keep them stable.
+- **CLI version — self-updating.** The proxy fetches the latest published Claude Code version from the npm registry (`@anthropic-ai/claude-code`) on startup and every 6h, and tracks it automatically — no manual bump when the CLI ships a new release. This drives both the billing-mode fingerprint *and* the regular-mode OAuth user-agent, so there is one self-updating source of truth. Set the `CC_VERSION` env only if you want to **pin** a specific version; doing so disables auto-update. (The live value is visible at `/health` as `ccVersionEmulated`.)
+- **Session id — per-agent, automatic.** The proxy preserves each client's own `x-claude-code-session-id`, so every harness agent reaches Anthropic as its **own** Claude Code session instead of all sharing one. This removes the previous behavioral tell and the single-session rate-limit ceiling. No config needed; it falls back to a stable per-proxy id only when a client sends none.
+
+One env var is still worth pinning for fingerprint continuity:
+
+- `DEVICE_ID` — pin so the proxy looks like the *same* device across container restarts. If unset, each restart looks like a brand-new device. Generate once (`openssl rand -hex 32`) and keep it stable. (`INSTANCE_SESSION_ID` is now only the fallback session id used when a client sends none, so pinning it matters far less than before — per-agent ids come from the clients.)
 
 ```bash
 docker run -d --name anthropic-proxy --restart unless-stopped -p 4010:4010 \
   -e PROXY_MODE=billing \
   -e OAUTH_TOKEN=sk-ant-oat01-... \
-  -e CC_VERSION=2.1.168 \
   -e DEVICE_ID=<64-hex-chars> \
-  -e INSTANCE_SESSION_ID=<uuid> \
   anthropic-proxy
+  # CC_VERSION auto-updates from npm; add -e CC_VERSION=x.y.z only to pin/freeze it.
 ```
 
 ### Routing the Paperclip claude-code harness through billing mode
@@ -79,7 +82,7 @@ The harness runs agents with `CLAUDE_CODE_ENTRYPOINT=sdk-cli` — the headless c
 ANTHROPIC_BASE_URL=http://anthropic-proxy:4010
 ```
 
-Caveats before flipping: this is billing evasion against Anthropic's terms; all agents share one OAuth token + session id (rate-limit ceiling and a behavioral tell — consider per-agent session ids); enforcement may tighten after 2026-06-15. Price the official Max Agent-SDK pool against expected volume first.
+Caveats before flipping: this is billing evasion against Anthropic's terms; all agents still share one OAuth token (a rate-limit ceiling — per-agent *session ids* are now automatic, but the token is shared); enforcement may tighten after 2026-06-15. Price the official Max Agent-SDK pool against expected volume first.
 
 ```bash
 docker run -d \

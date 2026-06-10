@@ -44,12 +44,52 @@ const TARGET = 'api.anthropic.com';
 const OAUTH_PREFIX = 'sk-ant-oat';
 const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-const OAUTH_HEADERS = {
-  'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14',
-  'anthropic-dangerous-direct-browser-access': 'true',
-  'user-agent': 'claude-cli/2.1.75',
-  'x-app': 'cli',
-};
+// --- Live Claude Code version ------------------------------------------------
+// The CLI version we declare to Anthropic should track the real published Claude
+// Code release rather than a hand-bumped constant that silently goes stale.
+// We read the latest version from the npm registry — the same source the CLI
+// itself ships from — and refresh periodically. This feeds BOTH the regular-mode
+// OAuth user-agent and (via billing.setCCVersion) the billing-mode fingerprint,
+// so there is one self-updating source of truth.
+//
+// Resolution: CC_VERSION env pins the value and disables auto-update (explicit
+// ops override); otherwise the live npm version is used; otherwise the fallback.
+const CC_VERSION_FALLBACK = '2.1.168';
+const CC_VERSION_PINNED = !!process.env.CC_VERSION;
+const CC_VERSION_LATEST_URL = 'https://registry.npmjs.org/@anthropic-ai/claude-code/latest';
+const CC_VERSION_REFRESH_MS = 6 * 60 * 60 * 1000;
+let liveCCVersion = process.env.CC_VERSION || CC_VERSION_FALLBACK;
+
+function applyCCVersion(v) {
+  if (!/^\d+\.\d+\.\d+$/.test(v || '') || v === liveCCVersion) return;
+  liveCCVersion = v;
+  if (BILLING_MODE && billing) billing.setCCVersion(v);
+  console.log(`[PROXY] Claude Code version → ${v} (self-updated from npm)`);
+}
+
+function refreshCCVersion() {
+  if (CC_VERSION_PINNED) return; // explicit env pin: never auto-update
+  https.get(CC_VERSION_LATEST_URL, { headers: { accept: 'application/json' } }, r => {
+    if (r.statusCode !== 200) { r.resume(); console.error(`[PROXY] CC version fetch: HTTP ${r.statusCode}`); return; }
+    let d = '';
+    r.on('data', c => d += c);
+    r.on('end', () => {
+      try { applyCCVersion(JSON.parse(d).version); }
+      catch (e) { console.error(`[PROXY] CC version parse failed: ${e.message}`); }
+    });
+  }).on('error', e => console.error(`[PROXY] CC version fetch failed: ${e.message}`));
+}
+
+// Regular-mode OAuth headers. Built per-call so the user-agent tracks the live
+// Claude Code version instead of a frozen string.
+function oauthHeaders() {
+  return {
+    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'user-agent': `claude-cli/${liveCCVersion}`,
+    'x-app': 'cli',
+  };
+}
 
 // Static fallback list — only used when the live Anthropic /v1/models endpoint
 // can't be reached (no token available, or upstream error). The proxy prefers
@@ -105,7 +145,7 @@ function buildModelFetchHeaders(reqHeaders) {
   const headers = { 'anthropic-version': '2023-06-01' };
   if (clientHasOAuth) {
     headers['authorization'] = `Bearer ${apiKey}`;
-    Object.assign(headers, OAUTH_HEADERS);
+    Object.assign(headers, oauthHeaders());
   } else if (apiKey) {
     headers['x-api-key'] = apiKey;
   } else {
@@ -398,6 +438,11 @@ const handler = (req, res) => {
           : null))
       : null;
 
+    // Per-agent session id (billing mode): prefer the client's own so each agent
+    // is a distinct Claude Code session rather than all sharing one. Computed once
+    // here and reused for the billing headers and the body metadata.
+    const billingSessionId = BILLING_MODE ? billing.deriveSessionId(req.headers) : null;
+
     // Build outbound headers
     const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
     if (BILLING_MODE) {
@@ -405,10 +450,10 @@ const handler = (req, res) => {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'billing mode requires an OAuth token: send sk-ant-oat... via Authorization header, or set OAUTH_TOKEN env on the proxy' }));
       }
-      Object.assign(headers, billing.buildBillingHeaders(billingTokenSource.accessToken, req.headers));
+      Object.assign(headers, billing.buildBillingHeaders(billingTokenSource.accessToken, req.headers, billingSessionId));
     } else if (isOAuth) {
       headers['authorization'] = `Bearer ${apiKey}`;
-      Object.assign(headers, OAUTH_HEADERS);
+      Object.assign(headers, oauthHeaders());
     } else {
       headers['x-api-key'] = apiKey;
     }
@@ -424,7 +469,7 @@ const handler = (req, res) => {
         return res.end(JSON.stringify({ error: 'Bad request body: ' + e.message }));
       }
       // In billing mode, run the body through the 8-layer transformer
-      if (BILLING_MODE) bodyStr = billing.processBody(bodyStr);
+      if (BILLING_MODE) bodyStr = billing.processBody(bodyStr, billingSessionId);
       const bodyBuf = Buffer.from(bodyStr);
       headers['content-length'] = String(bodyBuf.length);
 
@@ -554,7 +599,7 @@ const handler = (req, res) => {
 
       if (BILLING_MODE) {
         // Billing mode: run full request transformation pipeline (8 layers)
-        bodyBuf = Buffer.from(billing.processBody(sourceBodyStr));
+        bodyBuf = Buffer.from(billing.processBody(sourceBodyStr, billingSessionId));
       } else if (parsed) {
         // Regular mode: inject Claude Code system prompt for OAuth + cap cache_control
         if (isOAuth) {
@@ -691,4 +736,11 @@ server.listen(PORT, '0.0.0.0', () => {
   }
   console.log(`[PROXY] Endpoints: /health, /v1/models, /v1/chat/completions, /v1/messages`);
   console.log(`[PROXY] Point SillyTavern/LiteLLM at: ${proto}://<host>:${PORT}`);
+  if (CC_VERSION_PINNED) {
+    console.log(`[PROXY] CC version pinned via env: ${liveCCVersion} (auto-update disabled)`);
+  } else {
+    console.log(`[PROXY] CC version auto-update on (npm latest, every ${CC_VERSION_REFRESH_MS / 3600000}h); starting at ${liveCCVersion}`);
+    refreshCCVersion();
+    setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS).unref();
+  }
 });
