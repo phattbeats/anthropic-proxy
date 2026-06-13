@@ -1,86 +1,61 @@
-# Anthropic OAuth Proxy — Docker Container
+# Anthropic OAuth Proxy
 
-Thin proxy that fixes OAuth token handling for Anthropic API. Two modes via `PROXY_MODE` env var.
+Thin Docker proxy that fixes OAuth token handling for the Anthropic API. Mode set via `PROXY_MODE`.
 
-**Regular mode (default):** client provides its own token; proxy fixes OAuth headers and translates OpenAI→Anthropic.
+## Modes
+
+**Regular (default)** — client sends its own token; the proxy:
 - Moves `sk-ant-oat` tokens from `x-api-key` to `Authorization: Bearer`
 - Injects required OAuth headers + Claude Code system prompt
 - Translates OpenAI `/v1/chat/completions` → Anthropic `/v1/messages`
-- Serves `/v1/models` for SillyTavern model discovery — fetched **live** from Anthropic (cached 5 min) so newly released models appear automatically; falls back to a built-in static list when no token is available or upstream is unreachable
+- Serves `/v1/models` (fetched live from Anthropic, cached 5 min; falls back to a static list when no token/upstream)
 
-**Billing mode (`PROXY_MODE=billing`):** proxy stores its own Claude Code OAuth token and routes every request through your Claude subscription (instead of pay-per-token). Includes 8 layers of detection bypass adapted from [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy):
-- Billing fingerprint header injection (per-request SHA256)
-- String trigger sanitization (OpenClaw, sessions_*, etc.)
-- Tool name renames (29 OpenClaw tools → CC PascalCase)
-- System-prompt template strip + paraphrase
-- Tool description strip + CC tool-stub injection
-- Property-name renames (session_id, agent_id, etc.)
-- Bidirectional reverse mapping (SSE + JSON)
-- Trailing assistant-prefill strip
+**Billing (`PROXY_MODE=billing`)** — proxy stores its own Claude Code OAuth token and routes every request through your Claude subscription instead of pay-per-token. Includes 8 detection-bypass layers adapted from [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy): per-request fingerprint header, string-trigger sanitization, tool-name renames, system-prompt strip/paraphrase, tool-description strip + stub injection, property-name renames, bidirectional reverse mapping (SSE + JSON), trailing prefill strip.
 
-Token usage is logged for every request: `[USAGE] model=X in=Y out=Z`.
+Every request logs usage: `[USAGE] model=X in=Y out=Z`.
 
-## Deploy on Unraid
+## Deploy
 
-### Option A: Build locally
 ```bash
-cd /path/to/this/directory
 docker build -t anthropic-proxy .
-docker run -d \
-  --name anthropic-proxy \
-  --restart unless-stopped \
-  --network custom \
-  -p 4010:4010 \
-  anthropic-proxy
+docker run -d --name anthropic-proxy --restart unless-stopped \
+  --network <your-network> -p 4010:4010 anthropic-proxy
 ```
 
-### Option B: Unraid Community Apps (manual)
-1. Go to Docker tab → Add Container
-2. **Name:** `anthropic-proxy`
-3. **Repository:** (use the built image or point to a registry)
-4. **Network:** `custom`
-5. **Port:** `4010:4010`
-6. **Restart Policy:** `unless-stopped`
+Point your client (e.g. LiteLLM `api_base`) at `http://anthropic-proxy:4010` (same network) or `http://<host>:4010` (port-mapped).
 
-## Switching to Billing Mode
+## Billing mode
 
-To route all traffic through your Claude subscription instead of API billing:
-
-1. Get your Claude Code OAuth token: `cat ~/.claude/.credentials.json` (look for `accessToken`)
-2. Add env vars to the container:
-   - `PROXY_MODE=billing`
-   - `OAUTH_TOKEN=sk-ant-oat01-...` (or mount `~/.claude` as volume `/root/.claude:ro`)
-3. Restart the container
-
-Clients connecting to the proxy in billing mode do **not** need to send a token — the proxy uses its stored one for everything.
+1. Get your token: `cat ~/.claude/.credentials.json` → `accessToken`
+2. Run with:
 
 ```bash
-docker run -d \
-  --name anthropic-proxy \
-  --restart unless-stopped \
-  -p 4010:4010 \
+docker run -d --name anthropic-proxy --restart unless-stopped -p 4010:4010 \
   -e PROXY_MODE=billing \
   -e OAUTH_TOKEN=sk-ant-oat01-... \
+  -e DEVICE_ID=<64-hex> \
   anthropic-proxy
 ```
 
-## After Deploy
+Clients don't send a token in billing mode — the proxy uses its stored one. Mount `~/.claude:/root/.claude:ro` instead of `OAUTH_TOKEN` if preferred.
 
-Update LiteLLM config to point Anthropic models at the container:
-- **API Base:** `http://anthropic-proxy:4010` (if on same Docker network)
-- Or `http://YOURIP:4010` (if using host port mapping)
+**Self-maintaining fingerprint:**
+- **CLI version** — fetched from npm (`@anthropic-ai/claude-code`) on startup and every 6h; drives both billing-mode and regular-mode user-agent. Set `CC_VERSION` only to pin (disables auto-update).
+- **Session id** — each client's `x-claude-code-session-id` is preserved, so every agent reaches Anthropic as its own session (no shared-session tell or single-session rate ceiling). Falls back to a per-proxy id when none sent.
+- **`DEVICE_ID`** — pin so restarts look like the same device. Generate once: `openssl rand -hex 32`.
 
-## Health Check
+**Routing an SDK/headless harness through billing mode:** harnesses run with `CLAUDE_CODE_ENTRYPOINT=sdk-cli`, the category Anthropic surcharges (separate credit pool, effective 2026-06-15). Billing mode rewrites entrypoint/headers/body so requests look like interactive Claude Code. Point the harness at the proxy:
+
 ```bash
-curl http://localhost:4010/health
+ANTHROPIC_BASE_URL=http://anthropic-proxy:4010
+```
+
+Caveats: this is billing evasion against Anthropic's terms; all agents share one OAuth token (a rate-limit ceiling); enforcement may tighten after 2026-06-15. Price the official Agent-SDK pool against expected volume first.
+
+## Endpoints
+
+```bash
+curl http://localhost:4010/health      # mode, subscription, token expiry, request totals, ccVersionEmulated
 curl http://localhost:4010/v1/models
+docker logs -f anthropic-proxy | grep USAGE
 ```
-`/health` shows mode, subscription type (in billing mode), token expiry, and request totals.
-
-## Token Usage Logs
-
-Every request logs to stdout:
-```
-[USAGE] model=claude-sonnet-4-6 in=1234 out=567 | totals: req=42 in=51200 out=23400
-```
-Tail with `docker logs -f anthropic-proxy | grep USAGE` for billing visibility.
