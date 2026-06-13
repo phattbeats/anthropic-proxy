@@ -475,6 +475,30 @@ function loadOAuthToken() {
   throw new Error('No OAUTH_TOKEN env var and no Claude credentials at ~/.claude/.credentials.json');
 }
 
+// Re-read the stored token from disk when our in-memory copy is within
+// TOKEN_REFRESH_SKEW_MS of expiry. sk-ant-oat tokens last only hours; Claude
+// Code (running wherever the creds live) rewrites ~/.claude/.credentials.json in
+// place on its own refresh cycle, so we just need to pick the new value up
+// instead of caching the boot-time token forever. No-op for the OAUTH_TOKEN env
+// path (expiresAt: Infinity — nothing on disk to re-read) and while still fresh.
+// Returns the freshest token object; on a read error keeps the existing one
+// (a stale token that might still work beats no token).
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+function refreshTokenIfStale(cached) {
+  if (!cached || !isFinite(cached.expiresAt)) return cached;
+  if (Date.now() < cached.expiresAt - TOKEN_REFRESH_SKEW_MS) return cached;
+  try {
+    const fresh = loadOAuthToken();
+    if (fresh && fresh.accessToken && fresh.accessToken !== cached.accessToken) {
+      console.log('[PROXY] Stored OAuth token refreshed from credentials file (was near/after expiry)');
+    }
+    return fresh;
+  } catch (e) {
+    console.log(`[PROXY] Stored token refresh failed (${e.message}); keeping current token`);
+    return cached;
+  }
+}
+
 function buildBillingHeaders(oauthToken, existingHeaders, sessionId) {
   const headers = {};
   for (const [key, value] of Object.entries(existingHeaders || {})) {
@@ -501,6 +525,7 @@ module.exports = {
   reverseMapBuffer,
   createSSETransformer,
   loadOAuthToken,
+  refreshTokenIfStale,
   buildBillingHeaders,
   deriveSessionId,
   setCCVersion,
