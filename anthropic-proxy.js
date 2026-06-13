@@ -39,6 +39,17 @@ if (BILLING_MODE) {
   }
 }
 
+// Billing-mode stored-token accessor. The token loaded at boot expires in hours;
+// this re-reads the credentials file when it nears expiry so the stored-token
+// path survives a token rollover without a proxy restart, and writes the refresh
+// back to the cache. Billing-only: billingOAuthFallback is null in regular mode,
+// so this is a no-op there. Returns null when no stored token is available.
+function currentStoredToken() {
+  if (!billingOAuthFallback) return null;
+  billingOAuthFallback = billing.refreshTokenIfStale(billingOAuthFallback);
+  return billingOAuthFallback ? billingOAuthFallback.accessToken : null;
+}
+
 const PORT = parseInt(process.argv[2] || process.env.PROXY_PORT || '4010');
 const TARGET = 'api.anthropic.com';
 const OAUTH_PREFIX = 'sk-ant-oat';
@@ -135,8 +146,7 @@ function buildModelFetchHeaders(reqHeaders) {
   const apiKey = getApiKey(reqHeaders);
   const clientHasOAuth = apiKey.startsWith(OAUTH_PREFIX);
   if (BILLING_MODE) {
-    const token = clientHasOAuth ? apiKey
-      : (billingOAuthFallback ? billingOAuthFallback.accessToken : null);
+    const token = clientHasOAuth ? apiKey : currentStoredToken();
     if (!token) return null;
     const headers = billing.buildBillingHeaders(token, reqHeaders);
     delete headers['content-type'];
@@ -434,8 +444,7 @@ const handler = (req, res) => {
     // fall back to proxy-stored. Returns null if neither is available.
     const billingTokenSource = BILLING_MODE
       ? (clientHasOAuth ? { accessToken: apiKey, source: 'client' }
-        : (billingOAuthFallback ? { accessToken: billingOAuthFallback.accessToken, source: 'stored' }
-          : null))
+        : (() => { const t = currentStoredToken(); return t ? { accessToken: t, source: 'stored' } : null; })())
       : null;
 
     // Per-agent session id (billing mode): prefer the client's own so each agent
