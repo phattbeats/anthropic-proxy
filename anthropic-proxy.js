@@ -39,6 +39,17 @@ if (BILLING_MODE) {
   }
 }
 
+// Billing-mode stored-token accessor. The token loaded at boot expires in hours;
+// this re-reads the credentials file when it nears expiry so the stored-token
+// path survives a token rollover without a proxy restart, and writes the refresh
+// back to the cache. Billing-only: billingOAuthFallback is null in regular mode,
+// so this is a no-op there. Returns null when no stored token is available.
+function currentStoredToken() {
+  if (!billingOAuthFallback) return null;
+  billingOAuthFallback = billing.refreshTokenIfStale(billingOAuthFallback);
+  return billingOAuthFallback ? billingOAuthFallback.accessToken : null;
+}
+
 const PORT = parseInt(process.argv[2] || process.env.PROXY_PORT || '4010');
 const TARGET = 'api.anthropic.com';
 const OAUTH_PREFIX = 'sk-ant-oat';
@@ -135,8 +146,7 @@ function buildModelFetchHeaders(reqHeaders) {
   const apiKey = getApiKey(reqHeaders);
   const clientHasOAuth = apiKey.startsWith(OAUTH_PREFIX);
   if (BILLING_MODE) {
-    const token = clientHasOAuth ? apiKey
-      : (billingOAuthFallback ? billingOAuthFallback.accessToken : null);
+    const token = clientHasOAuth ? apiKey : currentStoredToken();
     if (!token) return null;
     const headers = billing.buildBillingHeaders(token, reqHeaders);
     delete headers['content-type'];
@@ -434,8 +444,7 @@ const handler = (req, res) => {
     // fall back to proxy-stored. Returns null if neither is available.
     const billingTokenSource = BILLING_MODE
       ? (clientHasOAuth ? { accessToken: apiKey, source: 'client' }
-        : (billingOAuthFallback ? { accessToken: billingOAuthFallback.accessToken, source: 'stored' }
-          : null))
+        : (() => { const t = currentStoredToken(); return t ? { accessToken: t, source: 'stored' } : null; })())
       : null;
 
     // Per-agent session id (billing mode): prefer the client's own so each agent
@@ -594,7 +603,37 @@ const handler = (req, res) => {
         }
       } catch (e) {}
 
-      // Source-of-truth body string for either mode (after param strip)
+      // Cap cache_control breakpoints to Anthropic's hard max of 4, across
+      // system + tools + message content (document order, keeping the first 4 —
+      // the stable prefix that benefits most from caching). Mode-agnostic and
+      // done BEFORE the mode split so billing mode's transform downstream also
+      // operates on already-capped content. Clients like LiteLLM/openclaw can
+      // emit more than 4 breakpoints, which Anthropic rejects with
+      // "A maximum of 4 blocks with cache_control may be provided."
+      if (parsed) {
+        let cacheCount = 0;
+        const stripExcessCache = (blocks) => {
+          if (!Array.isArray(blocks)) return blocks;
+          return blocks.map(b => {
+            if (b && b.cache_control) {
+              cacheCount++;
+              if (cacheCount > 4) { const { cache_control, ...rest } = b; return rest; }
+            }
+            return b;
+          });
+        };
+        if (Array.isArray(parsed.system)) parsed.system = stripExcessCache(parsed.system);
+        if (Array.isArray(parsed.tools)) parsed.tools = stripExcessCache(parsed.tools);
+        if (Array.isArray(parsed.messages)) {
+          parsed.messages = parsed.messages.map(m => {
+            if (Array.isArray(m.content)) m.content = stripExcessCache(m.content);
+            return m;
+          });
+        }
+        if (cacheCount > 4) console.log(`[PROXY] Capped cache_control: stripped ${cacheCount - 4} excess block(s) (max 4)`);
+      }
+
+      // Source-of-truth body string for either mode (after param strip + cache cap)
       const sourceBodyStr = parsed ? JSON.stringify(parsed) : rawBody.toString();
 
       if (BILLING_MODE) {
@@ -612,28 +651,7 @@ const handler = (req, res) => {
             parsed.system = [{ type: 'text', text: CLAUDE_CODE_SYSTEM }, { type: 'text', text: parsed.system }];
           }
         }
-        let cacheCount = 0;
-        const stripExcessCache = (blocks) => {
-          if (!Array.isArray(blocks)) return blocks;
-          return blocks.map(b => {
-            if (b.cache_control) {
-              cacheCount++;
-              if (cacheCount > 4) {
-                const { cache_control, ...rest } = b;
-                return rest;
-              }
-            }
-            return b;
-          });
-        };
-        if (Array.isArray(parsed.system)) parsed.system = stripExcessCache(parsed.system);
-        if (Array.isArray(parsed.messages)) {
-          parsed.messages = parsed.messages.map(m => {
-            if (Array.isArray(m.content)) m.content = stripExcessCache(m.content);
-            return m;
-          });
-        }
-        if (cacheCount > 4) console.log(`[PROXY] Stripped ${cacheCount - 4} excess cache_control blocks`);
+        // cache_control already capped above (mode-agnostic); just serialize.
         bodyBuf = Buffer.from(JSON.stringify(parsed));
       }
 
