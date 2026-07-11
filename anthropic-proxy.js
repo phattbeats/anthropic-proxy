@@ -499,6 +499,9 @@ const handler = (req, res) => {
           let buffer = '';
           let inputTokens = 0;
           let outputTokens = 0;
+          let chatId = 'chatcmpl-proxy';
+          let sentRole = false;
+          const includeUsage = !!reqPayload.stream_options?.include_usage;
           // In billing mode, reverse-map each SSE event before re-parsing.
           const xform = BILLING_MODE ? billing.createSSETransformer() : null;
           const handleLines = (text) => {
@@ -511,20 +514,46 @@ const handler = (req, res) => {
                 if (data === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
                 try {
                   const ev = JSON.parse(data);
-                  if (ev.type === 'message_start' && ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
+                  if (ev.type === 'message_start') {
+                    if (ev.message?.id) chatId = ev.message.id;
+                    if (ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
+                    if (!sentRole) {
+                      sentRole = true;
+                      // OpenAI emits an initial chunk carrying only the role delta before any content.
+                      res.write(`data: ${JSON.stringify({
+                        id: chatId, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now()/1000), model,
+                        choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+                      })}\n\n`);
+                    }
+                  }
                   if (ev.type === 'message_delta' && ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
                   if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
                     res.write(`data: ${JSON.stringify({
-                      id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+                      id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }],
                     })}\n\n`);
                   } else if (ev.type === 'message_delta' && ev.delta?.stop_reason) {
                     res.write(`data: ${JSON.stringify({
-                      id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+                      id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: {}, finish_reason: ev.delta.stop_reason === 'end_turn' ? 'stop' : ev.delta.stop_reason }],
                     })}\n\n`);
+                    // OpenAI's stream_options.include_usage sends one extra chunk with
+                    // an empty choices array carrying final token usage before [DONE].
+                    if (includeUsage) {
+                      res.write(`data: ${JSON.stringify({
+                        id: chatId, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now()/1000), model,
+                        choices: [],
+                        usage: {
+                          prompt_tokens: inputTokens,
+                          completion_tokens: outputTokens,
+                          total_tokens: inputTokens + outputTokens,
+                        },
+                      })}\n\n`);
+                    }
                     res.write('data: [DONE]\n\n');
                   }
                 } catch(e) {}
