@@ -205,17 +205,17 @@ const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'se
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
 
-  // Strip ALL OpenAI-specific params that don't exist in Anthropic /v1/messages
-  // OpenAI supports many params Anthropic doesn't: temperature, top_p, etc.
+  // Strip OpenAI-only params that don't exist in Anthropic /v1/messages
   for (const p of STRIP_PARAMS) delete payload[p];
-  delete payload.temperature;    // Not supported by Anthropic messages endpoint
-  delete payload.top_p;             // Not supported by Anthropic messages endpoint
 
   const result = {
     model: payload.model,
     max_tokens: payload.max_tokens || 4096,
     stream: payload.stream || false,
   };
+  // temperature and top_p ARE supported by Anthropic /v1/messages — pass through.
+  if (payload.temperature !== undefined) result.temperature = payload.temperature;
+  if (payload.top_p !== undefined) result.top_p = payload.top_p;
 
   // Extract system messages
   const systemMessages = (payload.messages || []).filter(m => m.role === 'system');
@@ -238,9 +238,8 @@ function openAIToAnthropic(body, isOAuth) {
     content: typeof m.content === 'string' ? m.content : m.content,
   }));
 
-  // NOTE: temperature, top_p, presence_penalty, frequency_penalty were already stripped
-  // above. Do NOT add them back — Anthropic messages endpoint rejects them.
-  // stop → stop_sequences is the only valid mapping
+  // NOTE: presence_penalty, frequency_penalty, etc. were already stripped above —
+  // those have no Anthropic equivalent. stop → stop_sequences is the only mapping left.
   if (payload.stop !== undefined) result.stop_sequences = Array.isArray(payload.stop) ? payload.stop : [payload.stop];
 
   return JSON.stringify(result);
@@ -595,11 +594,11 @@ const handler = (req, res) => {
         parsed = JSON.parse(rawBody.toString());
         model = parsed?.model || model;
         isStream = !!parsed?.stream;
-        // Strip params Anthropic /v1/messages doesn't accept (LiteLLM/SillyTavern often send these)
+        // Strip OpenAI-only params Anthropic /v1/messages doesn't accept (LiteLLM/
+        // SillyTavern often send these even on the native endpoint). temperature and
+        // top_p ARE valid /v1/messages params, so they're left untouched — pass through.
         if (parsed) {
           for (const p of STRIP_PARAMS) delete parsed[p];
-          delete parsed.temperature;
-          delete parsed.top_p;
         }
       } catch (e) {}
 
