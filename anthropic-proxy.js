@@ -201,6 +201,26 @@ function fetchUpstreamModels(authHeaders, cb) {
 // Parameters SillyTavern sends that Anthropic doesn't support — strip them
 const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'seed', 'response_format', 'function_call', 'functions'];
 
+// Default max_tokens when the client omits it entirely. Most OpenAI-shaped
+// clients (SillyTavern, etc.) don't send max_tokens, and Anthropic's own
+// default of 4096 leaves long completions truncated. Anthropic rejects
+// requests whose max_tokens exceeds a model's output ceiling, so any value
+// used here (default or client-supplied) is clamped per-model below.
+const DEFAULT_MAX_TOKENS = 32768;
+const MODEL_MAX_OUTPUT_TOKENS = [
+  { pattern: /^claude-opus-4/, limit: 32000 },
+  { pattern: /^claude-sonnet-4/, limit: 64000 },
+  { pattern: /^claude-haiku-4/, limit: 64000 },
+  { pattern: /^claude-3-5-sonnet/, limit: 8192 },
+  { pattern: /^claude-3-5-haiku/, limit: 8192 },
+  { pattern: /^claude-haiku-3/, limit: 4096 },
+];
+
+function maxOutputTokensFor(model) {
+  const entry = MODEL_MAX_OUTPUT_TOKENS.find(e => e.pattern.test(model || ''));
+  return entry ? entry.limit : DEFAULT_MAX_TOKENS;
+}
+
 // Convert OpenAI chat/completions format to Anthropic messages format
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
@@ -213,7 +233,7 @@ function openAIToAnthropic(body, isOAuth) {
 
   const result = {
     model: payload.model,
-    max_tokens: payload.max_tokens || 4096,
+    max_tokens: Math.min(payload.max_tokens || DEFAULT_MAX_TOKENS, maxOutputTokensFor(payload.model)),
     stream: payload.stream || false,
   };
 
