@@ -222,6 +222,100 @@ function maxOutputTokensFor(model) {
   return entry ? entry.limit : DEFAULT_MAX_TOKENS;
 }
 
+// OpenAI `tools: [{type:'function', function:{name, description, parameters}}]`
+// → Anthropic `tools: [{name, description, input_schema}]`.
+function mapOpenAITools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  return tools.map(t => {
+    const fn = t.function || t;
+    return {
+      name: fn.name,
+      description: fn.description,
+      input_schema: fn.parameters || { type: 'object', properties: {} },
+    };
+  });
+}
+
+// OpenAI `tool_choice: 'auto'|'none'|'required'|{type:'function',function:{name}}`
+// → Anthropic `tool_choice: {type:'auto'|'any'|'tool', name?}`.
+// Returns { tool_choice, dropTools } — 'none' has no direct Anthropic equivalent
+// on older API versions, so we drop the tools array entirely to guarantee the
+// model can't call one, rather than risk an unsupported tool_choice.type.
+function mapOpenAIToolChoice(tool_choice) {
+  if (tool_choice === undefined || tool_choice === null) return { tool_choice: undefined, dropTools: false };
+  if (tool_choice === 'none') return { tool_choice: undefined, dropTools: true };
+  if (tool_choice === 'auto') return { tool_choice: { type: 'auto' }, dropTools: false };
+  if (tool_choice === 'required') return { tool_choice: { type: 'any' }, dropTools: false };
+  if (typeof tool_choice === 'object' && tool_choice.type === 'function' && tool_choice.function?.name) {
+    return { tool_choice: { type: 'tool', name: tool_choice.function.name }, dropTools: false };
+  }
+  return { tool_choice: undefined, dropTools: false };
+}
+
+// OpenAI message content (string or array of {type:'text'|'image_url', ...})
+// → Anthropic content blocks. Non-text/image parts are dropped.
+function mapOpenAIContentParts(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map(part => {
+    if (part.type === 'text') return { type: 'text', text: part.text };
+    return part;
+  });
+}
+
+// Convert one OpenAI message into zero-or-more Anthropic messages (role +
+// content blocks). `tool` role and assistant `tool_calls` need translation
+// into Anthropic's tool_result / tool_use content blocks.
+function convertOpenAIMessage(m) {
+  if (m.role === 'tool') {
+    return {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: m.tool_call_id,
+        content: typeof m.content === 'string' ? m.content : mapOpenAIContentParts(m.content),
+      }],
+    };
+  }
+
+  if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+    const blocks = [];
+    if (m.content) {
+      const text = typeof m.content === 'string' ? m.content : m.content.map(c => c.text || '').join('');
+      if (text) blocks.push({ type: 'text', text });
+    }
+    for (const tc of m.tool_calls) {
+      let input = {};
+      try { input = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch (e) { input = {}; }
+      blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name, input });
+    }
+    return { role: 'assistant', content: blocks };
+  }
+
+  return {
+    role: m.role === 'assistant' ? 'assistant' : 'user',
+    content: mapOpenAIContentParts(m.content),
+  };
+}
+
+// Anthropic requires alternating user/assistant turns — merge consecutive
+// same-role messages (e.g. several tool results in a row) into one, combining
+// their content into a single content-block array.
+function mergeConsecutiveRoles(messages) {
+  const merged = [];
+  for (const m of messages) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === m.role) {
+      const prevBlocks = Array.isArray(prev.content) ? prev.content : [{ type: 'text', text: prev.content }];
+      const curBlocks = Array.isArray(m.content) ? m.content : [{ type: 'text', text: m.content }];
+      prev.content = prevBlocks.concat(curBlocks);
+    } else {
+      merged.push({ role: m.role, content: m.content });
+    }
+  }
+  return merged;
+}
+
 // Convert OpenAI chat/completions format to Anthropic messages format
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
@@ -253,17 +347,30 @@ function openAIToAnthropic(body, isOAuth) {
   }
   if (systemBlocks.length > 0) result.system = systemBlocks;
 
-  // Convert messages
-  result.messages = chatMessages.map(m => ({
-    role: m.role === 'assistant' ? 'assistant' : 'user',
-    content: typeof m.content === 'string' ? m.content : m.content,
-  }));
+  // Convert messages (tool calls/results → tool_use/tool_result blocks),
+  // then merge consecutive same-role turns since Anthropic requires alternation.
+  result.messages = mergeConsecutiveRoles(chatMessages.map(convertOpenAIMessage));
+
+  // tools/tool_choice
+  const { tool_choice, dropTools } = mapOpenAIToolChoice(payload.tool_choice);
+  if (Array.isArray(payload.tools) && payload.tools.length > 0 && !dropTools) {
+    result.tools = mapOpenAITools(payload.tools);
+    if (tool_choice) result.tool_choice = tool_choice;
+  }
 
   // NOTE: presence_penalty, frequency_penalty, etc. were already stripped above —
   // those have no Anthropic equivalent. stop → stop_sequences is the only mapping left.
   if (payload.stop !== undefined) result.stop_sequences = Array.isArray(payload.stop) ? payload.stop : [payload.stop];
 
   return JSON.stringify(result);
+}
+
+// Anthropic stop_reason → OpenAI finish_reason
+function mapStopReason(stop_reason) {
+  if (stop_reason === 'end_turn' || stop_reason === 'stop_sequence') return 'stop';
+  if (stop_reason === 'tool_use') return 'tool_calls';
+  if (stop_reason === 'max_tokens') return 'length';
+  return stop_reason;
 }
 
 // Convert Anthropic response to OpenAI format
@@ -274,7 +381,18 @@ function anthropicToOpenAI(data, model, stream) {
     const r = JSON.parse(data);
     if (r.type === 'error') return data;
 
-    const text = r.content?.find(b => b.type === 'text')?.text || '';
+    const blocks = r.content || [];
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('');
+    const toolUseBlocks = blocks.filter(b => b.type === 'tool_use');
+    const message = { role: 'assistant', content: text || null };
+    if (toolUseBlocks.length > 0) {
+      message.tool_calls = toolUseBlocks.map(b => ({
+        id: b.id,
+        type: 'function',
+        function: { name: b.name, arguments: JSON.stringify(b.input || {}) },
+      }));
+    }
+
     return JSON.stringify({
       id: r.id || 'chatcmpl-proxy',
       object: 'chat.completion',
@@ -282,8 +400,8 @@ function anthropicToOpenAI(data, model, stream) {
       model: r.model || model,
       choices: [{
         index: 0,
-        message: { role: 'assistant', content: text },
-        finish_reason: r.stop_reason === 'end_turn' ? 'stop' : r.stop_reason,
+        message,
+        finish_reason: mapStopReason(r.stop_reason),
       }],
       usage: {
         prompt_tokens: r.usage?.input_tokens || 0,
@@ -575,6 +693,10 @@ const handler = (req, res) => {
           let chatId = 'chatcmpl-proxy';
           let sentRole = false;
           const includeUsage = !!reqPayload.stream_options?.include_usage;
+          // Anthropic content-block index → OpenAI tool_calls array index, so
+          // interleaved tool_use blocks map to stable, incrementing tool_calls[].index.
+          const toolCallIndexByBlock = {};
+          let nextToolCallIndex = 0;
           // In billing mode, reverse-map each SSE event before re-parsing.
           const xform = BILLING_MODE ? billing.createSSETransformer() : null;
           const handleLines = (text) => {
@@ -601,17 +723,34 @@ const handler = (req, res) => {
                     }
                   }
                   if (ev.type === 'message_delta' && ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
-                  if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
+                  if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+                    const idx = nextToolCallIndex++;
+                    toolCallIndexByBlock[ev.index] = idx;
+                    res.write(`data: ${JSON.stringify({
+                      id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now()/1000), model,
+                      choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: ev.content_block.id, type: 'function', function: { name: ev.content_block.name, arguments: '' } }] }, finish_reason: null }],
+                    })}\n\n`);
+                  } else if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
                     res.write(`data: ${JSON.stringify({
                       id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }],
                     })}\n\n`);
+                  } else if (ev.type === 'content_block_delta' && ev.delta?.type === 'input_json_delta') {
+                    const idx = toolCallIndexByBlock[ev.index];
+                    if (idx !== undefined) {
+                      res.write(`data: ${JSON.stringify({
+                        id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now()/1000), model,
+                        choices: [{ index: 0, delta: { tool_calls: [{ index: idx, function: { arguments: ev.delta.partial_json || '' } }] }, finish_reason: null }],
+                      })}\n\n`);
+                    }
                   } else if (ev.type === 'message_delta' && ev.delta?.stop_reason) {
                     res.write(`data: ${JSON.stringify({
                       id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
-                      choices: [{ index: 0, delta: {}, finish_reason: ev.delta.stop_reason === 'end_turn' ? 'stop' : ev.delta.stop_reason }],
+                      choices: [{ index: 0, delta: {}, finish_reason: mapStopReason(ev.delta.stop_reason) }],
                     })}\n\n`);
                     // OpenAI's stream_options.include_usage sends one extra chunk with
                     // an empty choices array carrying final token usage before [DONE].
