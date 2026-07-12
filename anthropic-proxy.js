@@ -19,6 +19,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PROXY_DIR = __dirname;
 const USE_HTTPS = fs.existsSync(path.join(PROXY_DIR, 'proxy-key.pem'));
@@ -310,11 +311,17 @@ function logUsage(model, input, output) {
   totalOut += output || 0;
   console.log(`[USAGE] model=${model} in=${input || 0} out=${output || 0} | totals: req=${totalReq} in=${totalIn} out=${totalOut}`);
 }
+// Returns { input, output } when usage was present, else null — callers use
+// this to feed the per-request structured access log without re-parsing.
 function logUsageFromAnthropic(raw, model) {
   try {
     const r = JSON.parse(raw);
-    if (r.usage) logUsage(r.model || model, r.usage.input_tokens, r.usage.output_tokens);
+    if (r.usage) {
+      logUsage(r.model || model, r.usage.input_tokens, r.usage.output_tokens);
+      return { input: r.usage.input_tokens || 0, output: r.usage.output_tokens || 0 };
+    }
   } catch (e) {}
+  return null;
 }
 // Track usage from SSE message_delta events.
 function makeSSEUsageWatcher(model) {
@@ -345,7 +352,31 @@ function makeSSEUsageWatcher(model) {
         logged = true;
       }
     },
+    get() { return { input: inputTokens, output: outputTokens }; },
   };
+}
+
+// --- Structured per-request JSONL access log ---------------------------------
+// One JSON line per completed request: request id, route, model, status,
+// latency, tokens. Always written to stdout; optionally mirrored to LOG_FILE
+// for log shipping / offline analysis. This is separate from the human-
+// readable [PROXY]/[USAGE] console lines above, which stay as-is.
+const LOG_FILE = process.env.LOG_FILE || null;
+let logFileStream = null;
+if (LOG_FILE) {
+  logFileStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+  logFileStream.on('error', e => console.error(`[PROXY] LOG_FILE write error: ${e.message}`));
+  // Node never rotates this file itself — it grows unbounded for as long as
+  // the process runs. Point an external rotator (logrotate, Docker's own
+  // json-file/local log-driver rotation, etc.) at LOG_FILE, or pipe stdout
+  // instead of setting LOG_FILE if the platform already rotates stdout.
+  console.log(`[PROXY] Structured JSONL access log mirrored to LOG_FILE=${LOG_FILE} (grows unbounded — set up external rotation, e.g. logrotate)`);
+}
+
+function logAccess(entry) {
+  const line = JSON.stringify(entry);
+  console.log(line);
+  if (logFileStream) logFileStream.write(line + '\n');
 }
 
 function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
@@ -399,6 +430,28 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
 }
 
 const handler = (req, res) => {
+  const requestId = crypto.randomUUID();
+  const startTime = Date.now();
+  const routePath = (req.url || '').split('?')[0];
+  // Populated as each route learns the model / token usage; read at 'finish'
+  // so every route (including early returns, errors, passthrough) logs.
+  let logModel = null;
+  let logTokensIn = 0;
+  let logTokensOut = 0;
+  res.on('finish', () => {
+    logAccess({
+      ts: new Date().toISOString(),
+      id: requestId,
+      method: req.method,
+      route: routePath,
+      model: logModel,
+      status: res.statusCode,
+      latencyMs: Date.now() - startTime,
+      tokensIn: logTokensIn,
+      tokensOut: logTokensOut,
+    });
+  });
+
   let chunks = [];
   req.on('data', c => chunks.push(c));
   req.on('end', () => {
@@ -503,6 +556,7 @@ const handler = (req, res) => {
 
       const reqPayload = JSON.parse(rawBody.toString());
       const model = reqPayload.model;
+      logModel = model;
       const isStreaming = !!reqPayload.stream;
       const options = {
         hostname: TARGET, port: 443, path: '/v1/messages', method: 'POST', headers,
@@ -591,6 +645,8 @@ const handler = (req, res) => {
               if (tail) handleLines(tail);
             }
             if (inputTokens || outputTokens) logUsage(model, inputTokens, outputTokens);
+            logTokensIn = inputTokens;
+            logTokensOut = outputTokens;
             res.end();
           });
           // Guard against upstream connection drops mid-stream.
@@ -605,7 +661,8 @@ const handler = (req, res) => {
             let buf = Buffer.concat(respChunks);
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
             const raw = buf.toString();
-            logUsageFromAnthropic(raw, model);
+            const u = logUsageFromAnthropic(raw, model);
+            if (u) { logTokensIn = u.input; logTokensOut = u.output; }
             const converted = anthropicToOpenAI(raw, model, false);
             res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
             res.end(converted);
@@ -642,6 +699,7 @@ const handler = (req, res) => {
       try {
         parsed = JSON.parse(rawBody.toString());
         model = parsed?.model || model;
+        logModel = model;
         isStream = !!parsed?.stream;
         // Strip OpenAI-only params Anthropic /v1/messages doesn't accept (LiteLLM/
         // SillyTavern often send these even on the native endpoint). temperature and
@@ -727,11 +785,20 @@ const handler = (req, res) => {
               const tail = xform.onEnd();
               if (tail) res.write(tail);
               usageWatcher.flush();
+              const u = usageWatcher.get();
+              logTokensIn = u.input;
+              logTokensOut = u.output;
               res.end();
             });
           } else {
             upRes.on('data', chunk => { usageWatcher.feed(chunk); res.write(chunk); });
-            upRes.on('end', () => { usageWatcher.flush(); res.end(); });
+            upRes.on('end', () => {
+              usageWatcher.flush();
+              const u = usageWatcher.get();
+              logTokensIn = u.input;
+              logTokensOut = u.output;
+              res.end();
+            });
           }
           upRes.on('error', e => {
             console.error(`[PROXY] /v1/messages SSE upstream error: ${e.message}`);
@@ -744,7 +811,8 @@ const handler = (req, res) => {
             let buf = Buffer.concat(respChunks);
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
             const raw = buf.toString();
-            logUsageFromAnthropic(raw, model);
+            const u = logUsageFromAnthropic(raw, model);
+            if (u) { logTokensIn = u.input; logTokensOut = u.output; }
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(buf);
