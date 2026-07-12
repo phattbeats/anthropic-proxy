@@ -201,6 +201,26 @@ function fetchUpstreamModels(authHeaders, cb) {
 // Parameters SillyTavern sends that Anthropic doesn't support — strip them
 const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'seed', 'response_format', 'function_call', 'functions'];
 
+// Default max_tokens when the client omits it entirely. Most OpenAI-shaped
+// clients (SillyTavern, etc.) don't send max_tokens, and Anthropic's own
+// default of 4096 leaves long completions truncated. Anthropic rejects
+// requests whose max_tokens exceeds a model's output ceiling, so any value
+// used here (default or client-supplied) is clamped per-model below.
+const DEFAULT_MAX_TOKENS = 32768;
+const MODEL_MAX_OUTPUT_TOKENS = [
+  { pattern: /^claude-opus-4/, limit: 32000 },
+  { pattern: /^claude-sonnet-4/, limit: 64000 },
+  { pattern: /^claude-haiku-4/, limit: 64000 },
+  { pattern: /^claude-3-5-sonnet/, limit: 8192 },
+  { pattern: /^claude-3-5-haiku/, limit: 8192 },
+  { pattern: /^claude-haiku-3/, limit: 4096 },
+];
+
+function maxOutputTokensFor(model) {
+  const entry = MODEL_MAX_OUTPUT_TOKENS.find(e => e.pattern.test(model || ''));
+  return entry ? entry.limit : DEFAULT_MAX_TOKENS;
+}
+
 // Convert OpenAI chat/completions format to Anthropic messages format
 function openAIToAnthropic(body, isOAuth) {
   const payload = JSON.parse(body);
@@ -213,7 +233,7 @@ function openAIToAnthropic(body, isOAuth) {
 
   const result = {
     model: payload.model,
-    max_tokens: payload.max_tokens || 4096,
+    max_tokens: Math.min(payload.max_tokens || DEFAULT_MAX_TOKENS, maxOutputTokensFor(payload.model)),
     stream: payload.stream || false,
   };
 
@@ -499,6 +519,9 @@ const handler = (req, res) => {
           let buffer = '';
           let inputTokens = 0;
           let outputTokens = 0;
+          let chatId = 'chatcmpl-proxy';
+          let sentRole = false;
+          const includeUsage = !!reqPayload.stream_options?.include_usage;
           // In billing mode, reverse-map each SSE event before re-parsing.
           const xform = BILLING_MODE ? billing.createSSETransformer() : null;
           const handleLines = (text) => {
@@ -511,20 +534,46 @@ const handler = (req, res) => {
                 if (data === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
                 try {
                   const ev = JSON.parse(data);
-                  if (ev.type === 'message_start' && ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
+                  if (ev.type === 'message_start') {
+                    if (ev.message?.id) chatId = ev.message.id;
+                    if (ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
+                    if (!sentRole) {
+                      sentRole = true;
+                      // OpenAI emits an initial chunk carrying only the role delta before any content.
+                      res.write(`data: ${JSON.stringify({
+                        id: chatId, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now()/1000), model,
+                        choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+                      })}\n\n`);
+                    }
+                  }
                   if (ev.type === 'message_delta' && ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
                   if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
                     res.write(`data: ${JSON.stringify({
-                      id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+                      id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }],
                     })}\n\n`);
                   } else if (ev.type === 'message_delta' && ev.delta?.stop_reason) {
                     res.write(`data: ${JSON.stringify({
-                      id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+                      id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: {}, finish_reason: ev.delta.stop_reason === 'end_turn' ? 'stop' : ev.delta.stop_reason }],
                     })}\n\n`);
+                    // OpenAI's stream_options.include_usage sends one extra chunk with
+                    // an empty choices array carrying final token usage before [DONE].
+                    if (includeUsage) {
+                      res.write(`data: ${JSON.stringify({
+                        id: chatId, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now()/1000), model,
+                        choices: [],
+                        usage: {
+                          prompt_tokens: inputTokens,
+                          completion_tokens: outputTokens,
+                          total_tokens: inputTokens + outputTokens,
+                        },
+                      })}\n\n`);
+                    }
                     res.write('data: [DONE]\n\n');
                   }
                 } catch(e) {}
