@@ -990,14 +990,22 @@ const handler = (req, res) => {
           res.writeHead(upRes.statusCode, sseHeaders);
           const usageWatcher = makeSSEUsageWatcher(model);
           if (BILLING_MODE) {
-            const xform = billing.createSSETransformer();
+            // Guard against createSSETransformer returning a bad value (a botched
+            // build once shipped a body-less wrapper that returned undefined and
+            // crash-looped the whole proxy — see PHA-1391). If the transformer is
+            // unusable, degrade to raw passthrough rather than taking the process down.
+            let xform = billing.createSSETransformer();
+            if (!xform || typeof xform.onData !== 'function') {
+              console.error('[PROXY] createSSETransformer returned invalid transformer; passing SSE through unmapped');
+              xform = null;
+            }
             upRes.on('data', chunk => {
               usageWatcher.feed(chunk);
-              const out = xform.onData(chunk);
+              const out = xform ? xform.onData(chunk) : chunk.toString();
               if (out) res.write(out);
             });
             upRes.on('end', () => {
-              const tail = xform.onEnd();
+              const tail = xform ? xform.onEnd() : '';
               if (tail) res.write(tail);
               usageWatcher.flush();
               const u = usageWatcher.get();
@@ -1073,6 +1081,18 @@ if (USE_HTTPS) {
 } else {
   server = http.createServer(handler);
 }
+
+// Last-resort crash guard. A throw inside a stream 'data'/'end' callback is not
+// caught by any per-request try/catch and, without this handler, exits the
+// process — turning one malformed response into a crash-loop that takes the
+// proxy down for every client (PHA-1391). Log and keep serving instead; a
+// broken single stream is far better than a dead proxy.
+process.on('uncaughtException', (e) => {
+  console.error(`[PROXY] uncaughtException (kept alive): ${e && e.stack ? e.stack : e}`);
+});
+process.on('unhandledRejection', (e) => {
+  console.error(`[PROXY] unhandledRejection (kept alive): ${e && e.stack ? e.stack : e}`);
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
