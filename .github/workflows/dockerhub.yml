@@ -34,12 +34,13 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.version }}}"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          TAGS="$IMAGE:$TAG,$IMAGE:$TAG-${GITHUB_SHA}"
           # Stable if: v1.x.x or v2.x.x (not v0.x.x, not v1.0.0-beta)
           if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "stable=true" >> $GITHUB_OUTPUT
-          else
-            echo "stable=false" >> $GITHUB_OUTPUT
+            TAGS="$TAGS,$IMAGE:latest"
           fi
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU for multi-arch
         uses: docker/setup-qemu-action@v3
@@ -61,20 +62,12 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: PROXY_VERSION=${{ github.ref_name }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}-${{ github.sha }}
+          # :latest is pushed from the SAME build as the versioned tags (one
+          # digest, PROXY_VERSION included) — a separate latest-only build step
+          # previously omitted PROXY_VERSION, so :latest reported "unknown" on
+          # /health and couldn't be matched to a release (PHA-1391).
+          tags: ${{ steps.version.outputs.tags }}
           labels: |
             org.opencontainers.image.title=Anthropic OAuth Proxy
             org.opencontainers.image.description=Thin proxy that fixes OAuth token handling for Anthropic API — Unraid Docker image
             org.opencontainers.image.source=https://github.com/phattbeats/anthropic-proxy
-
-      - name: Tag as latest (stable releases only)
-        if: steps.version.outputs.stable == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: docker.io/${{ env.IMAGE_NAME }}:latest
