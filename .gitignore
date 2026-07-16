@@ -1,0 +1,3 @@
+# account_uuid secret for billing-mode disguise (PHA-1389) — never commit
+config.json
+.claude/
