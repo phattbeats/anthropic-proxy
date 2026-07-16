@@ -53,6 +53,18 @@ function currentStoredToken() {
 
 const PORT = parseInt(process.argv[2] || process.env.PROXY_PORT || '4010');
 const TARGET = 'api.anthropic.com';
+// Idle-socket timeout for upstream Anthropic requests. Without this, a stalled
+// upstream connection leaks the socket and hangs the client indefinitely.
+// Generous enough for long thinking/streaming turns; override via env.
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '600000');
+// Attach an idle timeout that destroys the request on stall. The existing
+// 'error' handlers turn the resulting destroy into a 502 (or clean stream end).
+function attachUpstreamTimeout(req, label) {
+  req.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    console.error(`[PROXY] upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms (${label})`);
+    req.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`));
+  });
+}
 const OAUTH_PREFIX = 'sk-ant-oat';
 const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -196,6 +208,7 @@ function fetchUpstreamModels(authHeaders, cb) {
     });
   });
   upReq.on('error', cb);
+  attachUpstreamTimeout(upReq, 'GET /v1/models');
   upReq.end();
 }
 
@@ -570,6 +583,7 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
     }
   });
 
+  attachUpstreamTimeout(proxyReq, `${method} ${targetPath}`);
   if (body && body.length > 0) proxyReq.write(body);
   proxyReq.end();
 }
@@ -880,6 +894,7 @@ const handler = (req, res) => {
           res.end(JSON.stringify({ error: e.message }));
         } else if (res.writable) res.end();
       });
+      attachUpstreamTimeout(proxyReq, 'POST /v1/messages (chat/completions)');
       proxyReq.write(bodyBuf);
       proxyReq.end();
       return;
@@ -1032,6 +1047,7 @@ const handler = (req, res) => {
           res.end(JSON.stringify({ error: e.message }));
         } else if (res.writable) res.end();
       });
+      attachUpstreamTimeout(upstreamReq, 'POST /v1/messages');
       upstreamReq.write(bodyBuf);
       upstreamReq.end();
       return;
