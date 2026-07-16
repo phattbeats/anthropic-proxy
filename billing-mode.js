@@ -404,156 +404,7 @@ function reverseMapBuffer(buf) {
 }
 
 // SSE transformer: returns { onData(chunk), onEnd() } that emit transformed text.
-function createSSETransformer() {
-// PHA-1387 (2026-07-15): Buffered SSE transformer.
-// Replaces the naive per-event reverse-map that missed matches when a masked
-// term split across Anthropic content_block_delta boundaries. We now parse
-// delta.text out of each event via JSON.parse (not raw string concat across
-// event boundaries - that produced malformed JSON in earlier attempts),
-// buffer per content_block, hold back a small carry-over tail sized to the
-// longest reverse-mapped term, and flush on content_block_stop.
-//
-// Outbound REPLACEMENTS and its application are UNTOUCHED (load-bearing per
-// Brandon's HARD CONSTRAINT - see PHA-1386 comment).
-function computeMaxTermLength(reverseMapPairs, toolRenames, propRenames) {
-  let max = 0;
-  for (const [sanitized] of reverseMapPairs) {
-    if (sanitized.length > max) max = sanitized.length;
-  }
-  for (const [, cc] of toolRenames) {
-    if (cc.length + 2 > max) max = cc.length + 2; // +2 for the quote-wrapping
-  }
-  for (const [, renamed] of propRenames) {
-    if (renamed.length + 2 > max) max = renamed.length + 2;
-  }
-  return max;
-}
 
-function parseSSEEvent(event) {
-  const dataIdx0 = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-  if (dataIdx0 === -1) return null;
-  const dataIdx = dataIdx0 > 0 ? dataIdx0 + 1 : 0;
-  const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-  const dataStr = dataLineEnd === -1
-    ? event.slice(dataIdx + 6)
-    : event.slice(dataIdx + 6, dataLineEnd);
-  let obj;
-  try { obj = JSON.parse(dataStr); } catch { return null; }
-  return {
-    prefix: event.slice(0, dataIdx),
-    dataStr,
-    obj,
-    suffix: event.slice(dataIdx + 6 + dataStr.length),
-  };
-}
-
-function rebuildSSEEvent(parsed, newObj) {
-  return parsed.prefix + 'data: ' + JSON.stringify(newObj) + parsed.suffix;
-}
-
-function createBufferedSSETransformer(reverseMapFn, carryLen) {
-  const decoder = new StringDecoder('utf8');
-  let pending = '';
-  let currentBlockIsThinking = false;
-  let textCarry = '';
-
-  const flushCarryAsDelta = (index) => {
-    if (!textCarry) return '';
-    const mapped = reverseMapFn(textCarry);
-    textCarry = '';
-    return 'event: content_block_delta\ndata: ' +
-      JSON.stringify({
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'text_delta', text: mapped },
-      }) + '\n\n';
-  };
-
-  const processEvent = (event) => {
-    const parsed = parseSSEEvent(event);
-    if (!parsed) {
-      const flushed = textCarry ? reverseMapFn(textCarry) : '';
-      textCarry = '';
-      return (flushed || '') + reverseMapFn(event);
-    }
-
-    const { obj } = parsed;
-
-    if (obj.type === 'content_block_start') {
-      const isThinking = obj.content_block && (
-        obj.content_block.type === 'thinking' ||
-        obj.content_block.type === 'redacted_thinking'
-      );
-      currentBlockIsThinking = !!isThinking;
-      if (isThinking) return event;
-      return reverseMapFn(event);
-    }
-
-    if (obj.type === 'content_block_delta' &&
-        obj.delta && obj.delta.type === 'text_delta' &&
-        !currentBlockIsThinking) {
-      const combined = textCarry + obj.delta.text;
-      const mapped = reverseMapFn(combined);
-      if (mapped.length <= carryLen - 1) {
-        textCarry = mapped;
-        return '';
-      }
-      const safeEmitLen = mapped.length - (carryLen - 1);
-      const toEmit = mapped.slice(0, safeEmitLen);
-      textCarry = mapped.slice(safeEmitLen);
-      const newObj = { ...obj, delta: { ...obj.delta, text: toEmit } };
-      return rebuildSSEEvent(parsed, newObj);
-    }
-
-    if (obj.type === 'content_block_stop') {
-      const wasThinking = currentBlockIsThinking;
-      currentBlockIsThinking = false;
-      if (wasThinking) return event;
-      const combined = textCarry + event;
-      textCarry = '';
-      return flushCarryAsDelta(obj.index) + reverseMapFn(combined);
-    }
-
-    if (currentBlockIsThinking) return event;
-    return reverseMapFn(event);
-  };
-
-  return {
-    onData: (chunk) => {
-      pending += decoder.write(chunk);
-      const outParts = [];
-      let sepIdx;
-      while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
-        const event = pending.slice(0, sepIdx + 2);
-        pending = pending.slice(sepIdx + 2);
-        outParts.push(processEvent(event));
-      }
-      return outParts.join('');
-    },
-    onEnd: () => {
-      pending += decoder.end();
-      let out = '';
-      if (pending.length > 0) out += processEvent(pending);
-      if (textCarry.length > 0) {
-        out += reverseMapFn(textCarry);
-        textCarry = '';
-      }
-      return out;
-    },
-  };
-}
-
-// Compute the carry-over length once at module load.
-const SSE_CARRY_LEN = computeMaxTermLength(REVERSE_MAP, TOOL_RENAMES, PROP_RENAMES) + 1;
-
-// Original createSSETransformer wrapper - kept as an alias for any external
-// callers, now backed by the buffered implementation. The transformEvent
-// parameter is ignored - the buffered transformer handles all cases.
-function createSSETransformer() {
-  return createBufferedSSETransformer(reverseMap, SSE_CARRY_LEN);
-}
-
-}
 
 function loadOAuthToken() {
   if (process.env.OAUTH_TOKEN) {
@@ -617,6 +468,148 @@ function buildBillingHeaders(oauthToken, existingHeaders, sessionId) {
   for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
   headers['anthropic-beta'] = betas.join(',');
   return headers;
+}
+
+
+// PHA-1387 (2026-07-15): Buffered SSE transformer.
+// Replaces the naive per-event reverse-map that missed matches when a masked
+// term split across Anthropic content_block_delta boundaries. We now parse
+// delta.text out of each event via JSON.parse, buffer per content_block,
+// hold back a small carry-over tail sized to the longest remaining
+// reverse-mapped term, and flush on content_block_stop.
+//
+// Outbound REPLACEMENTS array and its application are UNTOUCHED (load-bearing
+// per Brandon's HARD CONSTRAINT - see PHA-1386 comment).
+function computeMaxTermLength(reverseMapPairs, toolRenames, propRenames) {
+  let max = 0;
+  for (const [sanitized] of reverseMapPairs) {
+    if (sanitized.length > max) max = sanitized.length;
+  }
+  for (const [, cc] of toolRenames) {
+    if (cc.length + 2 > max) max = cc.length + 2;
+  }
+  for (const [, renamed] of propRenames) {
+    if (renamed.length + 2 > max) max = renamed.length + 2;
+  }
+  return max;
+}
+
+function parseSSEEvent(event) {
+  const dataIdx0 = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+  if (dataIdx0 === -1) return null;
+  const dataIdx = dataIdx0 > 0 ? dataIdx0 + 1 : 0;
+  const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+  const dataStr = dataLineEnd === -1
+    ? event.slice(dataIdx + 6)
+    : event.slice(dataIdx + 6, dataLineEnd);
+  let obj;
+  try { obj = JSON.parse(dataStr); } catch { return null; }
+  return {
+    prefix: event.slice(0, dataIdx),
+    dataStr,
+    obj,
+    suffix: event.slice(dataIdx + 6 + dataStr.length),
+  };
+}
+
+function rebuildSSEEvent(parsed, newObj) {
+  return parsed.prefix + 'data: ' + JSON.stringify(newObj) + parsed.suffix;
+}
+
+function createBufferedSSETransformer(reverseMapFn, carryLen) {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let currentBlockIsThinking = false;
+  let textCarry = '';
+
+  const flushCarryAsDelta = (index) => {
+    if (!textCarry) return '';
+    const mapped = reverseMapFn(textCarry);
+    textCarry = '';
+    return 'event: content_block_delta\ndata: ' +
+      JSON.stringify({
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'text_delta', text: mapped },
+      }) + '\n\n';
+  };
+
+  const processEvent = (event) => {
+    const parsed = parseSSEEvent(event);
+    if (!parsed) {
+      const flushed = textCarry ? reverseMapFn(textCarry) : '';
+      textCarry = '';
+      return (flushed || '') + reverseMapFn(event);
+    }
+    const { obj } = parsed;
+    if (obj.type === 'content_block_start') {
+      const isThinking = obj.content_block && (
+        obj.content_block.type === 'thinking' ||
+        obj.content_block.type === 'redacted_thinking'
+      );
+      currentBlockIsThinking = !!isThinking;
+      if (isThinking) return event;
+      return reverseMapFn(event);
+    }
+    if (obj.type === 'content_block_delta' &&
+        obj.delta && obj.delta.type === 'text_delta' &&
+        !currentBlockIsThinking) {
+      const combined = textCarry + obj.delta.text;
+      const mapped = reverseMapFn(combined);
+      if (mapped.length <= carryLen - 1) {
+        textCarry = mapped;
+        return '';
+      }
+      const safeEmitLen = mapped.length - (carryLen - 1);
+      const toEmit = mapped.slice(0, safeEmitLen);
+      textCarry = mapped.slice(safeEmitLen);
+      const newObj = { ...obj, delta: { ...obj.delta, text: toEmit } };
+      return rebuildSSEEvent(parsed, newObj);
+    }
+    if (obj.type === 'content_block_stop') {
+      const wasThinking = currentBlockIsThinking;
+      currentBlockIsThinking = false;
+      if (wasThinking) return event;
+      const combined = textCarry + event;
+      textCarry = '';
+      return flushCarryAsDelta(obj.index) + reverseMapFn(combined);
+    }
+    if (currentBlockIsThinking) return event;
+    return reverseMapFn(event);
+  };
+
+  return {
+    onData: (chunk) => {
+      pending += decoder.write(chunk);
+      const outParts = [];
+      let sepIdx;
+      while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+        const event = pending.slice(0, sepIdx + 2);
+        pending = pending.slice(sepIdx + 2);
+        outParts.push(processEvent(event));
+      }
+      return outParts.join('');
+    },
+    onEnd: () => {
+      pending += decoder.end();
+      let out = '';
+      if (pending.length > 0) out += processEvent(pending);
+      if (textCarry.length > 0) {
+        out += reverseMapFn(textCarry);
+        textCarry = '';
+      }
+      return out;
+    },
+  };
+}
+
+// Single createSSETransformer wrapper - the only one in this file.
+// Returns a buffered transformer configured for this module's reverse-map.
+function createSSETransformer() {
+  return createBufferedSSETransformer(
+    reverseMap,
+    computeMaxTermLength(REVERSE_MAP, TOOL_RENAMES, PROP_RENAMES) + 1
+  );
 }
 
 module.exports = {
