@@ -27,6 +27,9 @@ const USE_HTTPS = fs.existsSync(path.join(PROXY_DIR, 'proxy-key.pem'));
 const PROXY_MODE = (process.env.PROXY_MODE || 'regular').toLowerCase();
 const BILLING_MODE = PROXY_MODE === 'billing';
 const billing = BILLING_MODE ? require('./billing-mode') : null;
+// Proxy version (PHA-1387 side quest: was hardcoded '2.1'; now plumbed from release tag).
+// Set PROXY_VERSION at build time (Dockerfile ENV from CI tag) or runtime.
+const PROXY_VERSION = process.env.PROXY_VERSION || 'unknown';
 // Stored OAuth token is optional in billing mode — if the client passes one in
 // the Authorization header / x-api-key, we use that instead. Only fall back to
 // stored creds when the client did not send a token.
@@ -608,7 +611,7 @@ const handler = (req, res) => {
       const health = {
         status: 'ok',
         proxy: 'anthropic-oauth-proxy',
-        version: '2.1',
+        version: PROXY_VERSION,
         mode: BILLING_MODE ? 'billing' : 'regular',
         timestamp: new Date().toISOString(),
         usage: { totalReq, totalIn, totalOut },
