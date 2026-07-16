@@ -373,13 +373,40 @@ function mapStopReason(stop_reason) {
   return stop_reason;
 }
 
+// Anthropic error → OpenAI error shape. OpenAI clients (LiteLLM, openclaw)
+// parse {"error":{message,type,code}}; passing Anthropic's
+// {"type":"error","error":{...}} through verbatim makes them misclassify
+// upstream overload/5xx as billing/auth failures. Keep the original
+// Anthropic type in `code` for debuggability.
+const ANTHROPIC_TO_OPENAI_ERROR_TYPE = {
+  invalid_request_error: 'invalid_request_error',
+  authentication_error: 'authentication_error',
+  permission_error: 'permission_error',
+  not_found_error: 'invalid_request_error',
+  request_too_large: 'invalid_request_error',
+  rate_limit_error: 'rate_limit_error',
+  api_error: 'server_error',
+  overloaded_error: 'server_error',
+};
+function anthropicErrorToOpenAI(r) {
+  const at = r.error?.type || 'api_error';
+  return JSON.stringify({
+    error: {
+      message: r.error?.message || 'upstream error',
+      type: ANTHROPIC_TO_OPENAI_ERROR_TYPE[at] || 'server_error',
+      code: at,
+      param: null,
+    },
+  });
+}
+
 // Convert Anthropic response to OpenAI format
 function anthropicToOpenAI(data, model, stream) {
   if (stream) return data; // passthrough SSE for now
 
   try {
     const r = JSON.parse(data);
-    if (r.type === 'error') return data;
+    if (r.type === 'error') return anthropicErrorToOpenAI(r);
 
     const blocks = r.content || [];
     const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('');
@@ -680,6 +707,28 @@ const handler = (req, res) => {
         hostname: TARGET, port: 443, path: '/v1/messages', method: 'POST', headers,
       };
       const proxyReq = https.request(options, proxyRes => {
+        // Upstream rejected the request (overloaded/rate-limit/auth) — the body
+        // is a JSON error, not SSE, even when the client asked for streaming.
+        // Relay it as an OpenAI-shape JSON error with the real status so
+        // clients classify it correctly instead of seeing a garbled stream.
+        if (proxyRes.statusCode !== 200) {
+          let errChunks = [];
+          proxyRes.on('data', c => errChunks.push(c));
+          proxyRes.on('end', () => {
+            let buf = Buffer.concat(errChunks);
+            if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
+            let body;
+            try { body = anthropicErrorToOpenAI(JSON.parse(buf.toString())); }
+            catch (e) { body = JSON.stringify({ error: { message: buf.toString() || `upstream returned ${proxyRes.statusCode}`, type: 'server_error', code: null, param: null } }); }
+            console.error(`[PROXY] chat/completions upstream ${proxyRes.statusCode}: ${body}`);
+            const eh = { 'Content-Type': 'application/json' };
+            if (proxyRes.headers['retry-after']) eh['Retry-After'] = proxyRes.headers['retry-after'];
+            res.writeHead(proxyRes.statusCode, eh);
+            res.end(body);
+          });
+          proxyRes.on('error', () => { try { res.end(); } catch (_) {} });
+          return;
+        }
         if (isStreaming) {
           // Stream SSE: translate Anthropic SSE → OpenAI SSE on the fly
           res.writeHead(proxyRes.statusCode, {
@@ -709,6 +758,15 @@ const handler = (req, res) => {
                 if (data === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
                 try {
                   const ev = JSON.parse(data);
+                  if (ev.type === 'error') {
+                    // Mid-stream upstream error (e.g. overloaded_error during an
+                    // incident). Dropping it makes the reply look like a silent
+                    // cutoff; surface it as an OpenAI-style stream error chunk.
+                    console.error(`[PROXY] chat/completions mid-stream error: ${data}`);
+                    res.write(`data: ${anthropicErrorToOpenAI(ev)}\n\n`);
+                    res.write('data: [DONE]\n\n');
+                    continue;
+                  }
                   if (ev.type === 'message_start') {
                     if (ev.message?.id) chatId = ev.message.id;
                     if (ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
