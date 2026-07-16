@@ -60,6 +60,7 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: PROXY_VERSION=${{ github.ref_name }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}-${{ github.sha }}
