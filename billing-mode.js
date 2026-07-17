@@ -39,15 +39,45 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 const DEVICE_ID = process.env.DEVICE_ID || crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = process.env.INSTANCE_SESSION_ID || crypto.randomUUID();
 
+// Real account UUID for this OAuth identity. Genuine Claude Code includes it in
+// metadata.user_id ({device_id, account_uuid, session_id}); its ABSENCE is the
+// primary detection tell behind the 2026-07-16 extra-usage block (openclaw PR #61).
+// Per-account and NOT in ~/.claude/.credentials.json — CC reads it from the OAuth
+// profile. Kept out of source: set via CC_ACCOUNT_UUID env, or an `account_uuid`
+// key in a gitignored config.json next to this file. Empty string until provided
+// (ops input required for the fix to be fully effective — see PHA-1389).
+let ACCOUNT_UUID = process.env.CC_ACCOUNT_UUID || '';
+try {
+  if (!ACCOUNT_UUID) {
+    const cfgPath = path.join(__dirname, 'config.json');
+    if (fs.existsSync(cfgPath)) {
+      ACCOUNT_UUID = (JSON.parse(fs.readFileSync(cfgPath, 'utf8')).account_uuid) || '';
+    }
+  }
+} catch (e) { /* missing/invalid config.json → leave ACCOUNT_UUID empty */ }
+
+// Last upstream request-id, used to emit the modern `cc_prev_req` billing-header
+// chain field genuine CC 2.1.205 sends on consecutive first-party requests. A
+// static header that never chains is itself a tell. Set by the core proxy from
+// each upstream response's request-id header via setLastRequestId().
+let LAST_REQUEST_ID = null;
+function setLastRequestId(id) { if (id) LAST_REQUEST_ID = id; }
+
+// Beta flags — EXACT list + order captured from genuine Claude Code 2.1.205
+// (openclaw-billing-proxy PR #61, capture-and-diff 2026-07-16). A merged/reordered
+// set is itself a fingerprint, so this is applied WHOLESALE (see buildBillingHeaders).
 const REQUIRED_BETAS = [
-  'oauth-2025-04-20',
   'claude-code-20250219',
+  'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
-  'advanced-tool-use-2025-11-20',
+  'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
+  'mid-conversation-system-2026-04-07',
+  'advisor-tool-2026-03-01',
+  'advanced-tool-use-2025-11-20',
   'effort-2025-11-24',
-  'fast-mode-2026-02-01',
+  'extended-cache-ttl-2025-04-11',
 ];
 
 const CC_TOOL_STUBS = [
@@ -161,7 +191,17 @@ function extractFirstUserText(bodyStr) {
 function buildBillingBlock(bodyStr) {
   const firstText = extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=cli; cch=00000;"}`;
+  // Genuine CC 2.1.205 (sdk-cli mode, captured 2026-07-16 for openclaw PR #61) emits:
+  //   "x-anthropic-billing-header: cc_version=<v.fp>; cc_entrypoint=sdk-cli;[ cc_prev_req=<id>;]"
+  // No `cch` field in this mode, and cc_entrypoint must match the user-agent (sdk-cli).
+  // The prev-request chain only appears once there is a prior request-id to chain.
+  //
+  // NOTE (PHA-1389): this flips cc_entrypoint cli→sdk-cli. Our prior model (see the
+  // June-15 surcharge memo) matched genuine INTERACTIVE cli; the current detection
+  // matches genuine 2.1.205, which runs sdk-cli, and PR #61 verified sdk-cli returns
+  // 200 with zero extra-usage. Realigning to genuine is what clears the block.
+  const prev = LAST_REQUEST_ID ? ` cc_prev_req=${LAST_REQUEST_ID};` : '';
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;${prev}"}`;
 }
 
 // Resolve the session id for a request. Prefer the client's own per-conversation
@@ -178,18 +218,27 @@ function deriveSessionId(reqHeaders) {
 
 function getStainlessHeaders(sessionId) {
   const p = process.platform;
-  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  // Genuine CC reports 'MacOS' (capital OS), not Node's 'macOS' — casing is a tell.
+  // CC_OS env pins this outright: our container runs Linux, but if the OAuth account's
+  // genuine traffic originates on a Mac, x-stainless-os=Linux is itself a mismatch tell
+  // (PHA-1389 residual). Set CC_OS=MacOS to align with the account's real platform.
+  const osName = process.env.CC_OS
+    || (p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p);
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  // Values below captured verbatim from genuine Claude Code 2.1.205 (openclaw PR #61,
+  // 2026-07-16). user-agent + entrypoint are sdk-cli to match genuine; package-version
+  // and runtime-version are pinned to genuine's, not this container's (Node's real
+  // process.version would be a mismatch tell).
   return {
-    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'user-agent': `claude-cli/${CC_VERSION} (external, sdk-cli)`,
     'x-app': 'cli',
     'x-claude-code-session-id': sessionId || INSTANCE_SESSION_ID,
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.81.0',
+    'x-stainless-package-version': '0.94.0',
     'x-stainless-runtime': 'node',
-    'x-stainless-runtime-version': process.version,
+    'x-stainless-runtime-version': 'v26.3.0',
     'x-stainless-retry-count': '0',
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true',
@@ -336,7 +385,13 @@ function processBody(bodyStr, sessionId) {
   }
 
   // Metadata injection
-  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: sessionIdForMeta });
+  // Genuine metadata.user_id is {device_id, account_uuid, session_id} in that order.
+  // account_uuid absence is the primary detection tell (PHA-1389 / openclaw PR #61);
+  // omit the key entirely when unset so we don't ship an obviously-empty value.
+  const metaObj = ACCOUNT_UUID
+    ? { device_id: DEVICE_ID, account_uuid: ACCOUNT_UUID, session_id: sessionIdForMeta }
+    : { device_id: DEVICE_ID, session_id: sessionIdForMeta };
+  const metaValue = JSON.stringify(metaObj);
   const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
   const existingMeta = m.indexOf('"metadata":{');
   if (existingMeta !== -1) {
@@ -463,10 +518,10 @@ function buildBillingHeaders(oauthToken, existingHeaders, sessionId) {
   headers['accept-encoding'] = 'identity';
   headers['anthropic-version'] = '2023-06-01';
   Object.assign(headers, getStainlessHeaders(sessionId || deriveSessionId(existingHeaders)));
-  const existingBeta = headers['anthropic-beta'] || '';
-  const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-  for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
-  headers['anthropic-beta'] = betas.join(',');
+  // Override the beta header WHOLESALE with the genuine 2.1.205 list/order. A merged
+  // set that keeps client-specific betas (or reorders) is itself a fingerprint
+  // (openclaw PR #61); genuine CC replaces the header wholesale, so we do too.
+  headers['anthropic-beta'] = REQUIRED_BETAS.join(',');
   return headers;
 }
 
@@ -622,6 +677,10 @@ module.exports = {
   buildBillingHeaders,
   deriveSessionId,
   setCCVersion,
+  setLastRequestId,
+  // Whether an account_uuid is configured — surfaced on /health so ops can confirm
+  // the primary anti-detection field is actually set before/after a deploy.
+  get accountUuidConfigured() { return !!ACCOUNT_UUID; },
   // Live getter so callers (health endpoint, logs) always see the current value
   // after a self-update, not a snapshot taken at module load.
   get CC_VERSION() { return CC_VERSION; },
