@@ -1096,7 +1096,7 @@ process.on('unhandledRejection', (e) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
-  console.log(`[PROXY] Anthropic OAuth proxy v2.1 listening on :${PORT} (${proto.toUpperCase()})`);
+  console.log(`[PROXY] Anthropic OAuth proxy v2.1 (build ${PROXY_VERSION}) listening on :${PORT} (${proto.toUpperCase()})`);
   console.log(`[PROXY] Mode: ${BILLING_MODE ? 'BILLING (subscription routing, full evasion)' : 'REGULAR (client-provided OAuth)'}`);
   if (BILLING_MODE) {
     const src = billingOAuthFallback
