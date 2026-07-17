@@ -577,15 +577,18 @@ function createBufferedSSETransformer(reverseMapFn, carryLen) {
   let currentBlockIsThinking = false;
   let textCarry = '';
 
+  // textCarry always holds ALREADY reverse-mapped text (see the text_delta path
+  // below, which stores mapped.slice(...)). Do NOT re-map it here — a second pass
+  // could corrupt terms whose replacement re-matches another rule. Emit as-is.
   const flushCarryAsDelta = (index) => {
     if (!textCarry) return '';
-    const mapped = reverseMapFn(textCarry);
+    const text = textCarry;
     textCarry = '';
     return 'event: content_block_delta\ndata: ' +
       JSON.stringify({
         type: 'content_block_delta',
         index,
-        delta: { type: 'text_delta', text: mapped },
+        delta: { type: 'text_delta', text },
       }) + '\n\n';
   };
 
@@ -625,9 +628,11 @@ function createBufferedSSETransformer(reverseMapFn, carryLen) {
       const wasThinking = currentBlockIsThinking;
       currentBlockIsThinking = false;
       if (wasThinking) return event;
-      const combined = textCarry + event;
-      textCarry = '';
-      return flushCarryAsDelta(obj.index) + reverseMapFn(combined);
+      // Flush the held-back tail as its own final text_delta BEFORE the stop
+      // event. The previous code cleared textCarry first, so flushCarryAsDelta
+      // no-op'd and the tail was prepended raw to the stop event — malformed SSE
+      // that clients drop, truncating the last ~20 chars of every reply (PHA-1399).
+      return flushCarryAsDelta(obj.index) + reverseMapFn(event);
     }
     if (currentBlockIsThinking) return event;
     return reverseMapFn(event);
@@ -649,8 +654,10 @@ function createBufferedSSETransformer(reverseMapFn, carryLen) {
       pending += decoder.end();
       let out = '';
       if (pending.length > 0) out += processEvent(pending);
+      // Any tail still buffered here is an abnormal end (no content_block_stop).
+      // textCarry is already reverse-mapped — emit as-is, don't map twice.
       if (textCarry.length > 0) {
-        out += reverseMapFn(textCarry);
+        out += textCarry;
         textCarry = '';
       }
       return out;
