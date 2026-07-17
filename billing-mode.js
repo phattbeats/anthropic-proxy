@@ -219,7 +219,11 @@ function deriveSessionId(reqHeaders) {
 function getStainlessHeaders(sessionId) {
   const p = process.platform;
   // Genuine CC reports 'MacOS' (capital OS), not Node's 'macOS' — casing is a tell.
-  const osName = p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  // CC_OS env pins this outright: our container runs Linux, but if the OAuth account's
+  // genuine traffic originates on a Mac, x-stainless-os=Linux is itself a mismatch tell
+  // (PHA-1389 residual). Set CC_OS=MacOS to align with the account's real platform.
+  const osName = process.env.CC_OS
+    || (p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p);
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   // Values below captured verbatim from genuine Claude Code 2.1.205 (openclaw PR #61,
   // 2026-07-16). user-agent + entrypoint are sdk-cli to match genuine; package-version
