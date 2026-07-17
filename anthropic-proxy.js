@@ -659,6 +659,7 @@ const handler = (req, res) => {
       };
       if (BILLING_MODE) {
         health.ccVersionEmulated = billing.CC_VERSION;
+        health.accountUuidConfigured = billing.accountUuidConfigured;
         health.tokenSource = billingOAuthFallback ? 'stored+client' : 'client-only';
         if (billingOAuthFallback) {
           const expiresIn = (billingOAuthFallback.expiresAt - Date.now()) / 3600000;
@@ -721,9 +722,14 @@ const handler = (req, res) => {
       logModel = model;
       const isStreaming = !!reqPayload.stream;
       const options = {
-        hostname: TARGET, port: 443, path: '/v1/messages', method: 'POST', headers,
+        // Genuine CC 2.1.205 posts to /v1/messages?beta=true (openclaw PR #61).
+        hostname: TARGET, port: 443,
+        path: BILLING_MODE ? '/v1/messages?beta=true' : '/v1/messages',
+        method: 'POST', headers,
       };
       const proxyReq = https.request(options, proxyRes => {
+        // Track upstream request-id to chain the next request's cc_prev_req header.
+        if (BILLING_MODE) billing.setLastRequestId(proxyRes.headers['request-id'] || proxyRes.headers['anthropic-request-id']);
         // Upstream rejected the request (overloaded/rate-limit/auth) — the body
         // is a JSON error, not SSE, even when the client asked for streaming.
         // Relay it as an OpenAI-shape JSON error with the real status so
@@ -981,8 +987,12 @@ const handler = (req, res) => {
       // In billing mode we need to apply reverseMap to the response body / SSE stream.
       // In regular mode we passthrough and just log usage.
       const upstreamReq = https.request({
-        hostname: TARGET, port: 443, path: '/v1/messages', method: 'POST', headers,
+        // Genuine CC 2.1.205 posts to /v1/messages?beta=true (openclaw PR #61).
+        hostname: TARGET, port: 443,
+        path: BILLING_MODE ? '/v1/messages?beta=true' : '/v1/messages',
+        method: 'POST', headers,
       }, upRes => {
+        if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id']);
         if (isStream) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];
