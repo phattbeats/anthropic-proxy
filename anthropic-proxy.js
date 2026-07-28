@@ -244,11 +244,17 @@ function mapOpenAITools(tools) {
   if (!Array.isArray(tools)) return undefined;
   return tools.map(t => {
     const fn = t.function || t;
-    return {
+    const out = {
       name: fn.name,
       description: fn.description,
       input_schema: fn.parameters || { type: 'object', properties: {} },
     };
+    // Prompt caching: a client that marked the tool block for caching (either on
+    // the OpenAI wrapper or on the inner function object) must keep that marker,
+    // or the whole tools prefix is re-billed as fresh input on every turn.
+    const cc = t.cache_control || fn.cache_control;
+    if (cc) out.cache_control = cc;
+    return out;
   });
 }
 
@@ -274,7 +280,13 @@ function mapOpenAIContentParts(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content.map(part => {
-    if (part.type === 'text') return { type: 'text', text: part.text };
+    if (part.type === 'text') {
+      const block = { type: 'text', text: part.text };
+      // Preserve a client-supplied cache breakpoint — rebuilding the block from
+      // scratch silently dropped it, which is why nothing cached on this path.
+      if (part.cache_control) block.cache_control = part.cache_control;
+      return block;
+    }
     return part;
   });
 }
@@ -359,7 +371,14 @@ function openAIToAnthropic(body, isOAuth) {
   }
   for (const s of systemMessages) {
     const text = typeof s.content === 'string' ? s.content : s.content.map(c => c.text || '').join('');
-    systemBlocks.push({ type: 'text', text });
+    const block = { type: 'text', text };
+    // The system prompt is the single highest-value cache breakpoint. Accept the
+    // marker either on the message itself or on any of its content parts — the
+    // parts are joined into one block here, so one marker covers the lot.
+    const cc = s.cache_control
+      || (Array.isArray(s.content) ? (s.content.find(c => c && c.cache_control) || {}).cache_control : undefined);
+    if (cc) block.cache_control = cc;
+    systemBlocks.push(block);
   }
   if (systemBlocks.length > 0) result.system = systemBlocks;
 
@@ -379,6 +398,37 @@ function openAIToAnthropic(body, isOAuth) {
   if (payload.stop !== undefined) result.stop_sequences = Array.isArray(payload.stop) ? payload.stop : [payload.stop];
 
   return JSON.stringify(result);
+}
+
+// Cap cache_control breakpoints to Anthropic's hard max of 4, across
+// system + tools + message content (document order, keeping the first 4 —
+// the stable prefix that benefits most from caching). Clients like LiteLLM/
+// openclaw can emit more than 4 breakpoints, which Anthropic rejects with
+// "A maximum of 4 blocks with cache_control may be provided."
+// Mutates and returns `parsed` (an Anthropic /v1/messages body); null-safe.
+function capCacheControl(parsed) {
+  if (!parsed) return parsed;
+  let cacheCount = 0;
+  const stripExcessCache = (blocks) => {
+    if (!Array.isArray(blocks)) return blocks;
+    return blocks.map(b => {
+      if (b && b.cache_control) {
+        cacheCount++;
+        if (cacheCount > 4) { const { cache_control, ...rest } = b; return rest; }
+      }
+      return b;
+    });
+  };
+  if (Array.isArray(parsed.system)) parsed.system = stripExcessCache(parsed.system);
+  if (Array.isArray(parsed.tools)) parsed.tools = stripExcessCache(parsed.tools);
+  if (Array.isArray(parsed.messages)) {
+    parsed.messages = parsed.messages.map(m => {
+      if (Array.isArray(m.content)) m.content = stripExcessCache(m.content);
+      return m;
+    });
+  }
+  if (cacheCount > 4) console.log(`[PROXY] Capped cache_control: stripped ${cacheCount - 4} excess block(s) (max 4)`);
+  return parsed;
 }
 
 // Anthropic stop_reason → OpenAI finish_reason
@@ -446,11 +496,7 @@ function anthropicToOpenAI(data, model, stream) {
         message,
         finish_reason: mapStopReason(r.stop_reason),
       }],
-      usage: {
-        prompt_tokens: r.usage?.input_tokens || 0,
-        completion_tokens: r.usage?.output_tokens || 0,
-        total_tokens: (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0),
-      }
+      usage: openAIUsage(extractUsage(r.usage)),
     });
   } catch (e) {
     return data;
@@ -463,32 +509,83 @@ function getApiKey(headers) {
   return headers['x-api-key'] || '';
 }
 
+// --- Usage extraction --------------------------------------------------------
+// Anthropic's input_tokens EXCLUDES cache_creation_input_tokens and
+// cache_read_input_tokens. Normalizing here is the only way the console log, the
+// JSONL access log and the OpenAI usage surface can agree on real prompt size.
+const EMPTY_USAGE = { input: 0, output: 0, cacheCreate: 0, cacheRead: 0, cache5m: 0, cache1h: 0 };
+function extractUsage(u) {
+  if (!u || typeof u !== 'object') return { ...EMPTY_USAGE };
+  const c = u.cache_creation || {};
+  return {
+    input: u.input_tokens || 0,
+    output: u.output_tokens || 0,
+    cacheCreate: u.cache_creation_input_tokens || 0,
+    cacheRead: u.cache_read_input_tokens || 0,
+    cache5m: c.ephemeral_5m_input_tokens || 0,
+    cache1h: c.ephemeral_1h_input_tokens || 0,
+  };
+}
+// Merge a later usage object over an earlier one (message_start -> message_delta).
+// A field only wins if the newer event reports it: message_delta omits the cache
+// fields, and must not zero out what message_start gave us.
+function mergeUsage(a, b) {
+  const out = { ...a };
+  for (const k of Object.keys(EMPTY_USAGE)) if (b[k]) out[k] = b[k];
+  return out;
+}
+// OpenAI semantics: cached tokens are a SUBSET of prompt_tokens.
+function openAIUsage(u) {
+  const prompt = u.input + u.cacheRead + u.cacheCreate;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: u.output,
+    total_tokens: prompt + u.output,
+    prompt_tokens_details: { cached_tokens: u.cacheRead },
+    cache_creation_input_tokens: u.cacheCreate,
+    cache_read_input_tokens: u.cacheRead,
+  };
+}
+
 let totalReq = 0;
 let totalIn = 0;
 let totalOut = 0;
-function logUsage(model, input, output) {
+let totalCacheCreate = 0;
+let totalCacheRead = 0;
+function logUsage(model, u) {
+  const usage = u || EMPTY_USAGE;
   totalReq++;
-  totalIn += input || 0;
-  totalOut += output || 0;
-  console.log(`[USAGE] model=${model} in=${input || 0} out=${output || 0} | totals: req=${totalReq} in=${totalIn} out=${totalOut}`);
+  totalIn += usage.input || 0;
+  totalOut += usage.output || 0;
+  totalCacheCreate += usage.cacheCreate || 0;
+  totalCacheRead += usage.cacheRead || 0;
+  // Only spell out the 5m/1h split when upstream actually reported one — most
+  // responses report neither, and a permanent "(5m=0 1h=0)" is pure noise.
+  const ttl = [];
+  if (usage.cache5m) ttl.push(`5m=${usage.cache5m}`);
+  if (usage.cache1h) ttl.push(`1h=${usage.cache1h}`);
+  const ttlStr = ttl.length ? ` (${ttl.join(' ')})` : '';
+  console.log(`[USAGE] model=${model} in=${usage.input || 0} out=${usage.output || 0} cache_write=${usage.cacheCreate || 0}${ttlStr} cache_read=${usage.cacheRead || 0} | totals: req=${totalReq} in=${totalIn} out=${totalOut} cache_write=${totalCacheCreate} cache_read=${totalCacheRead}`);
 }
-// Returns { input, output } when usage was present, else null — callers use
-// this to feed the per-request structured access log without re-parsing.
+// Returns a normalized usage object when usage was present, else null — callers
+// use this to feed the per-request structured access log without re-parsing.
 function logUsageFromAnthropic(raw, model) {
   try {
     const r = JSON.parse(raw);
     if (r.usage) {
-      logUsage(r.model || model, r.usage.input_tokens, r.usage.output_tokens);
-      return { input: r.usage.input_tokens || 0, output: r.usage.output_tokens || 0 };
+      const u = extractUsage(r.usage);
+      logUsage(r.model || model, u);
+      return u;
     }
   } catch (e) {}
   return null;
 }
-// Track usage from SSE message_delta events.
+// Track usage from SSE message_start / message_delta events. The cache counters
+// only ever arrive on message_start, so the two events must be merged, not
+// replaced, or the cache numbers are lost by the time the stream ends.
 function makeSSEUsageWatcher(model) {
   let buffer = '';
-  let inputTokens = 0;
-  let outputTokens = 0;
+  let usage = { ...EMPTY_USAGE };
   let logged = false;
   return {
     feed(chunk) {
@@ -499,21 +596,21 @@ function makeSSEUsageWatcher(model) {
         if (!line.startsWith('data: ')) continue;
         try {
           const ev = JSON.parse(line.slice(6).trim());
-          if (ev.type === 'message_start' && ev.message?.usage?.input_tokens) {
-            inputTokens = ev.message.usage.input_tokens;
-          } else if (ev.type === 'message_delta' && ev.usage?.output_tokens) {
-            outputTokens = ev.usage.output_tokens;
+          if (ev.type === 'message_start' && ev.message?.usage) {
+            usage = mergeUsage(usage, extractUsage(ev.message.usage));
+          } else if (ev.type === 'message_delta' && ev.usage) {
+            usage = mergeUsage(usage, extractUsage(ev.usage));
           }
         } catch (e) {}
       }
     },
     flush() {
-      if (!logged && (inputTokens || outputTokens)) {
-        logUsage(model, inputTokens, outputTokens);
+      if (!logged && (usage.input || usage.output || usage.cacheCreate || usage.cacheRead)) {
+        logUsage(model, usage);
         logged = true;
       }
     },
-    get() { return { input: inputTokens, output: outputTokens }; },
+    get() { return usage; },
   };
 }
 
@@ -598,8 +695,7 @@ const handler = (req, res) => {
   // Populated as each route learns the model / token usage; read at 'finish'
   // so every route (including early returns, errors, passthrough) logs.
   let logModel = null;
-  let logTokensIn = 0;
-  let logTokensOut = 0;
+  let logUsageAcc = { ...EMPTY_USAGE };
   res.on('finish', () => {
     logAccess({
       ts: new Date().toISOString(),
@@ -609,8 +705,12 @@ const handler = (req, res) => {
       model: logModel,
       status: res.statusCode,
       latencyMs: Date.now() - startTime,
-      tokensIn: logTokensIn,
-      tokensOut: logTokensOut,
+      tokensIn: logUsageAcc.input,
+      tokensOut: logUsageAcc.output,
+      cacheCreationTokens: logUsageAcc.cacheCreate,
+      cacheReadTokens: logUsageAcc.cacheRead,
+      cacheCreation5m: logUsageAcc.cache5m,
+      cacheCreation1h: logUsageAcc.cache1h,
     });
   });
 
@@ -655,7 +755,7 @@ const handler = (req, res) => {
         version: PROXY_VERSION,
         mode: BILLING_MODE ? 'billing' : 'regular',
         timestamp: new Date().toISOString(),
-        usage: { totalReq, totalIn, totalOut },
+        usage: { totalReq, totalIn, totalOut, totalCacheCreate, totalCacheRead },
       };
       if (BILLING_MODE) {
         health.ccVersionEmulated = billing.CC_VERSION;
@@ -708,6 +808,9 @@ const handler = (req, res) => {
       let bodyStr;
       try {
         bodyStr = openAIToAnthropic(rawBody.toString(), isOAuth);
+        // Now that translation preserves client cache_control, this path can also
+        // exceed Anthropic's 4-breakpoint max — cap it exactly like /v1/messages.
+        bodyStr = JSON.stringify(capCacheControl(JSON.parse(bodyStr)));
       } catch (e) {
         res.writeHead(400);
         return res.end(JSON.stringify({ error: 'Bad request body: ' + e.message }));
@@ -760,8 +863,7 @@ const handler = (req, res) => {
             'Connection': 'keep-alive',
           });
           let buffer = '';
-          let inputTokens = 0;
-          let outputTokens = 0;
+          let usage = { ...EMPTY_USAGE };
           let chatId = 'chatcmpl-proxy';
           let sentRole = false;
           const includeUsage = !!reqPayload.stream_options?.include_usage;
@@ -792,7 +894,7 @@ const handler = (req, res) => {
                   }
                   if (ev.type === 'message_start') {
                     if (ev.message?.id) chatId = ev.message.id;
-                    if (ev.message?.usage?.input_tokens) inputTokens = ev.message.usage.input_tokens;
+                    if (ev.message?.usage) usage = mergeUsage(usage, extractUsage(ev.message.usage));
                     if (!sentRole) {
                       sentRole = true;
                       // OpenAI emits an initial chunk carrying only the role delta before any content.
@@ -803,7 +905,7 @@ const handler = (req, res) => {
                       })}\n\n`);
                     }
                   }
-                  if (ev.type === 'message_delta' && ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
+                  if (ev.type === 'message_delta' && ev.usage) usage = mergeUsage(usage, extractUsage(ev.usage));
                   if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
                     const idx = nextToolCallIndex++;
                     toolCallIndexByBlock[ev.index] = idx;
@@ -840,11 +942,7 @@ const handler = (req, res) => {
                         id: chatId, object: 'chat.completion.chunk',
                         created: Math.floor(Date.now()/1000), model,
                         choices: [],
-                        usage: {
-                          prompt_tokens: inputTokens,
-                          completion_tokens: outputTokens,
-                          total_tokens: inputTokens + outputTokens,
-                        },
+                        usage: openAIUsage(usage),
                       })}\n\n`);
                     }
                     res.write('data: [DONE]\n\n');
@@ -864,9 +962,8 @@ const handler = (req, res) => {
               const tail = xform.onEnd();
               if (tail) handleLines(tail);
             }
-            if (inputTokens || outputTokens) logUsage(model, inputTokens, outputTokens);
-            logTokensIn = inputTokens;
-            logTokensOut = outputTokens;
+            if (usage.input || usage.output || usage.cacheCreate || usage.cacheRead) logUsage(model, usage);
+            logUsageAcc = usage;
             res.end();
           });
           // Guard against upstream connection drops mid-stream.
@@ -882,7 +979,7 @@ const handler = (req, res) => {
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
             const raw = buf.toString();
             const u = logUsageFromAnthropic(raw, model);
-            if (u) { logTokensIn = u.input; logTokensOut = u.output; }
+            if (u) logUsageAcc = u;
             const converted = anthropicToOpenAI(raw, model, false);
             res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
             res.end(converted);
@@ -930,35 +1027,9 @@ const handler = (req, res) => {
         }
       } catch (e) {}
 
-      // Cap cache_control breakpoints to Anthropic's hard max of 4, across
-      // system + tools + message content (document order, keeping the first 4 —
-      // the stable prefix that benefits most from caching). Mode-agnostic and
-      // done BEFORE the mode split so billing mode's transform downstream also
-      // operates on already-capped content. Clients like LiteLLM/openclaw can
-      // emit more than 4 breakpoints, which Anthropic rejects with
-      // "A maximum of 4 blocks with cache_control may be provided."
-      if (parsed) {
-        let cacheCount = 0;
-        const stripExcessCache = (blocks) => {
-          if (!Array.isArray(blocks)) return blocks;
-          return blocks.map(b => {
-            if (b && b.cache_control) {
-              cacheCount++;
-              if (cacheCount > 4) { const { cache_control, ...rest } = b; return rest; }
-            }
-            return b;
-          });
-        };
-        if (Array.isArray(parsed.system)) parsed.system = stripExcessCache(parsed.system);
-        if (Array.isArray(parsed.tools)) parsed.tools = stripExcessCache(parsed.tools);
-        if (Array.isArray(parsed.messages)) {
-          parsed.messages = parsed.messages.map(m => {
-            if (Array.isArray(m.content)) m.content = stripExcessCache(m.content);
-            return m;
-          });
-        }
-        if (cacheCount > 4) console.log(`[PROXY] Capped cache_control: stripped ${cacheCount - 4} excess block(s) (max 4)`);
-      }
+      // Mode-agnostic and done BEFORE the mode split so billing mode's transform
+      // downstream also operates on already-capped content.
+      capCacheControl(parsed);
 
       // Source-of-truth body string for either mode (after param strip + cache cap)
       const sourceBodyStr = parsed ? JSON.stringify(parsed) : rawBody.toString();
@@ -1018,18 +1089,14 @@ const handler = (req, res) => {
               const tail = xform ? xform.onEnd() : '';
               if (tail) res.write(tail);
               usageWatcher.flush();
-              const u = usageWatcher.get();
-              logTokensIn = u.input;
-              logTokensOut = u.output;
+              logUsageAcc = usageWatcher.get();
               res.end();
             });
           } else {
             upRes.on('data', chunk => { usageWatcher.feed(chunk); res.write(chunk); });
             upRes.on('end', () => {
               usageWatcher.flush();
-              const u = usageWatcher.get();
-              logTokensIn = u.input;
-              logTokensOut = u.output;
+              logUsageAcc = usageWatcher.get();
               res.end();
             });
           }
@@ -1045,7 +1112,7 @@ const handler = (req, res) => {
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
             const raw = buf.toString();
             const u = logUsageFromAnthropic(raw, model);
-            if (u) { logTokensIn = u.input; logTokensOut = u.output; }
+            if (u) logUsageAcc = u;
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(buf);
@@ -1124,3 +1191,8 @@ server.listen(PORT, '0.0.0.0', () => {
     setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS).unref();
   }
 });
+
+// Test seam only. When the proxy is started normally (`node anthropic-proxy.js`)
+// require.main === module, so this is a no-op and nothing above it changes.
+// scripts/pha1596-usage-unit.js requires the file to unit-test the pure helpers.
+if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, capCacheControl };
