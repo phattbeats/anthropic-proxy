@@ -183,6 +183,38 @@ const convert = (messages, extra) => JSON.parse(openAIToAnthropic(JSON.stringify
   ok('no marker: translation output unchanged');
 }
 
+// --- system prompt: stable prefix and dynamic suffix stay separate blocks ------
+{
+  // The shape OpenClaw sends: it splits its system prompt at OPENCLAW_CACHE_BOUNDARY
+  // and marks only the stable half. Joining the two into one block moved the
+  // breakpoint past the volatile half, so the biggest block in the request missed
+  // cache on every single turn.
+  const out = convert([
+    { role: 'system', content: [
+      { type: 'text', text: 'STABLE PREAMBLE', cache_control: EPH },
+      { type: 'text', text: 'dynamic: 03:41:07' },
+    ] },
+    { role: 'user', content: 'hi' },
+  ]);
+  assert.strictEqual(out.system.length, 2, 'system parts must not be joined');
+  assert.strictEqual(out.system[0].text, 'STABLE PREAMBLE');
+  assert.deepStrictEqual(out.system[0].cache_control, EPH, 'breakpoint stays on the stable prefix');
+  assert.strictEqual(out.system[1].text, 'dynamic: 03:41:07');
+  assert.strictEqual(out.system[1].cache_control, undefined, 'the volatile half stays outside the cache');
+  ok('system prompt: stable/dynamic split preserved');
+}
+
+{
+  const out = convert([
+    { role: 'system', content: [{ type: 'text', text: 'a' }, { type: 'text', text: '' }, { type: 'text', text: 'b' }], cache_control: EPH },
+    { role: 'user', content: 'hi' },
+  ]);
+  assert.strictEqual(out.system.length, 2, 'empty text parts dropped — Anthropic rejects them');
+  assert.strictEqual(out.system[0].cache_control, undefined);
+  assert.deepStrictEqual(out.system[1].cache_control, EPH, 'message-level marker lands on the last system block');
+  ok('system prompt: empty parts dropped, message-level marker on the last block');
+}
+
 // --- the new markers are counted by the 4-cap ---------------------------------
 {
   const messages = [{ role: 'system', content: 'sys', cache_control: EPH }];
