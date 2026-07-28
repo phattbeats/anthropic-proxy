@@ -291,19 +291,46 @@ function mapOpenAIContentParts(content) {
   });
 }
 
+// Find the cache breakpoint a client attached to one message. OpenAI's wire
+// format has no cache_control, so clients bolt it on in one of two places: on
+// the message object itself, or on one of its content parts (Anthropic's own
+// convention). Accept either; the part-level marker wins as the more specific
+// signal. Returns undefined when the message carries no breakpoint.
+function messageCacheControl(m) {
+  if (Array.isArray(m.content)) {
+    const marked = m.content.find(c => c && c.cache_control);
+    if (marked) return marked.cache_control;
+  }
+  return m.cache_control;
+}
+
 // Convert one OpenAI message into zero-or-more Anthropic messages (role +
 // content blocks). `tool` role and assistant `tool_calls` need translation
 // into Anthropic's tool_result / tool_use content blocks.
+//
+// Every branch here rebuilds blocks from scratch, so each one has to re-apply
+// the client's cache breakpoint or the prefix is re-billed as fresh input.
+// A message-level marker lands on the message's LAST block: cache_control
+// caches everything up to and including its own block, so marking the last one
+// is what "cache through the end of this turn" actually means.
 function convertOpenAIMessage(m) {
+  const cc = messageCacheControl(m);
+
   if (m.role === 'tool') {
-    return {
-      role: 'user',
-      content: [{
-        type: 'tool_result',
-        tool_use_id: m.tool_call_id,
-        content: typeof m.content === 'string' ? m.content : mapOpenAIContentParts(m.content),
-      }],
-    };
+    let inner = typeof m.content === 'string' ? m.content : mapOpenAIContentParts(m.content);
+    // A marker nested inside tool_result content is invisible to capCacheControl
+    // (which only walks top-level blocks) and could push the request past
+    // Anthropic's max of 4. It was already hoisted onto `cc` above, so drop it
+    // from the nested block and carry it on the tool_result itself.
+    if (Array.isArray(inner)) {
+      inner = inner.map(b => {
+        if (b && b.cache_control) { const { cache_control, ...rest } = b; return rest; }
+        return b;
+      });
+    }
+    const block = { type: 'tool_result', tool_use_id: m.tool_call_id, content: inner };
+    if (cc) block.cache_control = cc;
+    return { role: 'user', content: [block] };
   }
 
   if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
@@ -317,13 +344,28 @@ function convertOpenAIMessage(m) {
       try { input = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch (e) { input = {}; }
       blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name, input });
     }
+    // Anthropic accepts cache_control on a tool_use block, which is what the
+    // last block is whenever the assistant turn ended in a tool call.
+    if (cc && blocks.length > 0) blocks[blocks.length - 1].cache_control = cc;
     return { role: 'assistant', content: blocks };
   }
 
-  return {
-    role: m.role === 'assistant' ? 'assistant' : 'user',
-    content: mapOpenAIContentParts(m.content),
-  };
+  const role = m.role === 'assistant' ? 'assistant' : 'user';
+  const content = mapOpenAIContentParts(m.content);
+  if (cc) {
+    if (Array.isArray(content)) {
+      // mapOpenAIContentParts already carried part-level markers across. Only
+      // place a message-level one when none survived — a second breakpoint for
+      // the same message would burn one of Anthropic's four for nothing.
+      if (content.length > 0 && !content.some(b => b && b.cache_control)) {
+        content[content.length - 1] = { ...content[content.length - 1], cache_control: cc };
+      }
+    } else if (typeof content === 'string' && content) {
+      // A bare string can't hold a marker; promote it to a single text block.
+      return { role, content: [{ type: 'text', text: content, cache_control: cc }] };
+    }
+  }
+  return { role, content };
 }
 
 // Anthropic requires alternating user/assistant turns — merge consecutive
