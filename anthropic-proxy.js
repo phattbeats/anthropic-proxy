@@ -411,16 +411,30 @@ function openAIToAnthropic(body, isOAuth) {
   if (isOAuth) {
     systemBlocks.push({ type: 'text', text: CLAUDE_CODE_SYSTEM });
   }
+  // The system prompt is the single highest-value cache breakpoint, so keep the
+  // client's part boundaries instead of joining them. Clients deliberately split
+  // it into a stable prefix (marked) and a per-request dynamic suffix (unmarked)
+  // — OpenClaw does exactly this at its OPENCLAW_CACHE_BOUNDARY. Joining them put
+  // the breakpoint *after* the volatile half, so the largest block in the request
+  // changed every turn and never hit cache.
   for (const s of systemMessages) {
-    const text = typeof s.content === 'string' ? s.content : s.content.map(c => c.text || '').join('');
-    const block = { type: 'text', text };
-    // The system prompt is the single highest-value cache breakpoint. Accept the
-    // marker either on the message itself or on any of its content parts — the
-    // parts are joined into one block here, so one marker covers the lot.
-    const cc = s.cache_control
-      || (Array.isArray(s.content) ? (s.content.find(c => c && c.cache_control) || {}).cache_control : undefined);
-    if (cc) block.cache_control = cc;
-    systemBlocks.push(block);
+    const parts = typeof s.content === 'string'
+      ? [{ text: s.content }]
+      : (Array.isArray(s.content) ? s.content.filter(c => c && typeof c.text === 'string') : []);
+    const blocks = [];
+    for (const p of parts) {
+      if (!p.text) continue; // an empty text block is rejected by Anthropic
+      const block = { type: 'text', text: p.text };
+      if (p.cache_control) block.cache_control = p.cache_control;
+      blocks.push(block);
+    }
+    if (blocks.length === 0) continue;
+    // A marker on the message itself covers the whole message, so it lands on the
+    // last block — but only when no part carried its own, more specific one.
+    if (s.cache_control && !blocks.some(b => b.cache_control)) {
+      blocks[blocks.length - 1].cache_control = s.cache_control;
+    }
+    systemBlocks.push(...blocks);
   }
   if (systemBlocks.length > 0) result.system = systemBlocks;
 
