@@ -685,6 +685,9 @@ module.exports = {
   deriveSessionId,
   setCCVersion,
   setLastRequestId,
+  // Exposed so the main proxy can verify (at startup, in tests) that the TTL
+  // beta is present without re-defining it. Single source of truth. PHA-1611.
+  REQUIRED_BETAS,
   // Whether an account_uuid is configured — surfaced on /health so ops can confirm
   // the primary anti-detection field is actually set before/after a deploy.
   get accountUuidConfigured() { return !!ACCOUNT_UUID; },

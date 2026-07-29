@@ -108,15 +108,36 @@ function refreshCCVersion() {
 }
 
 // Regular-mode OAuth headers. Built per-call so the user-agent tracks the live
-// Claude Code version instead of a frozen string.
+// Claude Code version instead of a frozen string. PHA-1611: the 1h prompt-cache
+// TTL beta (`extended-cache-ttl-2025-04-11`) is included here so cache TTL does
+// NOT depend on PROXY_MODE=billing being active. Without it, switching the proxy
+// out of billing mode silently drops 1h cache writes to 5m — invisible until
+// someone notices the bill climb.
 function oauthHeaders() {
   return {
-    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14',
+    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11',
     'anthropic-dangerous-direct-browser-access': 'true',
     'user-agent': `claude-cli/${liveCCVersion}`,
     'x-app': 'cli',
   };
 }
+
+// PHA-1611: log the active TTL beta + PROXY_MODE at startup so the state is
+// visible in `docker logs` instead of buried in an array. If the active beta
+// list does not contain the TTL beta, emit a loud warning — that combination
+// silently degrades 1h cache writes to 5m. Cheap tripwire.
+const TTL_BETA = 'extended-cache-ttl-2025-04-11';
+function activeBetaList() {
+  return BILLING_MODE ? (billing && billing.REQUIRED_BETAS) : oauthHeaders()['anthropic-beta'].split(',');
+}
+(function ttlStartupCheck() {
+  const betas = activeBetaList();
+  const hasTtl = Array.isArray(betas) && betas.includes(TTL_BETA);
+  console.log(`[PROXY] PROXY_MODE=${PROXY_MODE} TTL_BETA=${TTL_BETA} active=${hasTtl ? 'on' : 'OFF'}`);
+  if (!hasTtl) {
+    console.error(`[PROXY] WARNING: ${TTL_BETA} is NOT in the active beta list for PROXY_MODE=${PROXY_MODE} — 1h prompt-cache writes will silently fall back to 5m. See PHA-1611.`);
+  }
+})();
 
 // Static fallback list — only used when the live Anthropic /v1/models endpoint
 // can't be reached (no token available, or upstream error). The proxy prefers
