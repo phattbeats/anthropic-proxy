@@ -107,11 +107,26 @@ function refreshCCVersion() {
   }).on('error', e => console.error(`[PROXY] CC version fetch failed: ${e.message}`));
 }
 
+// Beta flags that EVERY outbound request to Anthropic must carry, regardless of
+// PROXY_MODE. The 1h prompt-cache TTL depends on `extended-cache-ttl-2025-04-11`
+// being present — without it, every cache write silently falls back to 5m and
+// nothing errors. Keep this list in sync with billing-mode.js REQUIRED_BETAS
+// (billing overwrites the header wholesale, so we set it explicitly here for
+// the regular path).
+const OAUTH_BETAS = [
+  'claude-code-20250219',
+  'oauth-2025-04-20',
+  'fine-grained-tool-streaming-2025-05-14',
+  'interleaved-thinking-2025-05-14',
+  'extended-cache-ttl-2025-04-11',
+];
+const TTL_BETA = 'extended-cache-ttl-2025-04-11';
+
 // Regular-mode OAuth headers. Built per-call so the user-agent tracks the live
 // Claude Code version instead of a frozen string.
 function oauthHeaders() {
   return {
-    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14',
+    'anthropic-beta': OAUTH_BETAS.join(','),
     'anthropic-dangerous-direct-browser-access': 'true',
     'user-agent': `claude-cli/${liveCCVersion}`,
     'x-app': 'cli',
@@ -1175,6 +1190,16 @@ server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
   console.log(`[PROXY] Anthropic OAuth proxy v2.1 (build ${PROXY_VERSION}) listening on :${PORT} (${proto.toUpperCase()})`);
   console.log(`[PROXY] Mode: ${BILLING_MODE ? 'BILLING (subscription routing, full evasion)' : 'REGULAR (client-provided OAuth)'}`);
+  // Pin the 1h prompt-cache TTL beta to PROXY_MODE so this state is visible in
+  // `docker logs` instead of buried in an array. The assertion below trips if
+  // either path drops the TTL beta — that's the silent-5m-fallback failure mode
+  // PHA-1611 was filed against.
+  const activeBetas = BILLING_MODE ? billing.REQUIRED_BETAS : OAUTH_BETAS;
+  const ttlOk = activeBetas.includes(TTL_BETA);
+  console.log(`[PROXY] Cache TTL beta: ${TTL_BETA} (${ttlOk ? 'present' : 'MISSING'}) in ${BILLING_MODE ? 'billing' : 'oauth'} beta list (${activeBetas.length} entries)`);
+  if (!ttlOk) {
+    console.error(`[PROXY] FATAL: ${TTL_BETA} not in active beta list — every cache write will silently fall back to 5m. Fix OAUTH_BETAS / REQUIRED_BETAS.`);
+  }
   if (BILLING_MODE) {
     const src = billingOAuthFallback
       ? `stored fallback (${billingOAuthFallback.subscriptionType}) + client-provided`
