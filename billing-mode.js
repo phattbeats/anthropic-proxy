@@ -691,4 +691,7 @@ module.exports = {
   // Live getter so callers (health endpoint, logs) always see the current value
   // after a self-update, not a snapshot taken at module load.
   get CC_VERSION() { return CC_VERSION; },
+  // The full beta list this module installs on every outbound request. Exposed
+  // so the bootstrap can assert the 1h cache TTL beta is present (PHA-1611).
+  get REQUIRED_BETAS() { return REQUIRED_BETAS; },
 };
