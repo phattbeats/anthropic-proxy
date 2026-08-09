@@ -54,7 +54,10 @@ function currentStoredToken() {
   return billingOAuthFallback ? billingOAuthFallback.accessToken : null;
 }
 
-const PORT = parseInt(process.argv[2] || process.env.PROXY_PORT || '4010');
+// PROXY_PORT env wins over argv[2] so container/process supervisors can override
+// the CLI arg without rebuilding the command line. parseInt radix is explicit
+// to avoid octal/hex surprises on leading-zero ports (PHA-1844 audit, M1).
+const PORT = parseInt(process.env.PROXY_PORT || process.argv[2] || '4010', 10);
 const TARGET = 'api.anthropic.com';
 // Idle-socket timeout for upstream Anthropic requests. Without this, a stalled
 // upstream connection leaks the socket and hangs the client indefinitely.
@@ -94,17 +97,31 @@ function applyCCVersion(v) {
   console.log(`[PROXY] Claude Code version → ${v} (self-updated from npm)`);
 }
 
+// Hard caps on the npm-registry version fetch: a stalled or hostile response
+// must not block the proxy startup or grow unbounded in memory (PHA-1844 audit, M7).
+const CC_VERSION_FETCH_TIMEOUT_MS = 15000;
+const CC_VERSION_FETCH_MAX_BYTES = 5 * 1024 * 1024; // 5MB — npm latest is ~1KB; 5MB is generous headroom.
+
 function refreshCCVersion() {
   if (CC_VERSION_PINNED) return; // explicit env pin: never auto-update
-  https.get(CC_VERSION_LATEST_URL, { headers: { accept: 'application/json' } }, r => {
-    if (r.statusCode !== 200) { r.resume(); console.error(`[PROXY] CC version fetch: HTTP ${r.statusCode}`); return; }
+  let settled = false;
+  const done = (err) => { if (settled) return; settled = true; if (err) console.error(`[PROXY] CC version fetch ${err}`); };
+  const req = https.get(CC_VERSION_LATEST_URL, { headers: { accept: 'application/json' } }, r => {
+    if (r.statusCode !== 200) { r.resume(); done(`HTTP ${r.statusCode}`); return; }
+    let total = 0;
     let d = '';
-    r.on('data', c => d += c);
+    r.on('data', c => {
+      total += c.length;
+      if (total > CC_VERSION_FETCH_MAX_BYTES) { req.destroy(new Error('payload too large')); done(`exceeded ${CC_VERSION_FETCH_MAX_BYTES}B`); return; }
+      d += c;
+    });
     r.on('end', () => {
       try { applyCCVersion(JSON.parse(d).version); }
-      catch (e) { console.error(`[PROXY] CC version parse failed: ${e.message}`); }
+      catch (e) { done(`parse failed: ${e.message}`); }
     });
-  }).on('error', e => console.error(`[PROXY] CC version fetch failed: ${e.message}`));
+  });
+  req.setTimeout(CC_VERSION_FETCH_TIMEOUT_MS, () => { req.destroy(new Error('timeout')); done(`timeout after ${CC_VERSION_FETCH_TIMEOUT_MS}ms`); });
+  req.on('error', e => done(`failed: ${e.message}`));
 }
 
 // Beta flags that EVERY outbound request to Anthropic must carry, regardless of
@@ -785,9 +802,31 @@ const handler = (req, res) => {
     });
   });
 
+  // Hard cap on inbound request body. Without this a single client can POST
+  // unbounded data and exhaust proxy memory before any per-route logic runs
+  // (PHA-1844 audit, H2). 64MB is well above any realistic Claude request and
+  // comfortably accommodates multi-megapixel image attachments.
+  const MAX_BODY_BYTES = 64 * 1024 * 1024;
+  let bodyBytes = 0;
+  let bodyTooLarge = false;
   let chunks = [];
-  req.on('data', c => chunks.push(c));
+  req.on('data', c => {
+    if (bodyTooLarge) { c; return; }
+    bodyBytes += c.length;
+    if (bodyBytes > MAX_BODY_BYTES) {
+      bodyTooLarge = true;
+      chunks = []; // drop what we already buffered; nothing valid to parse
+      if (!res.headersSent) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Request body exceeds ${MAX_BODY_BYTES} bytes (MAX_BODY_BYTES)` }));
+      }
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
   req.on('end', () => {
+    if (bodyTooLarge) return; // already responded 413 above
     const rawBody = Buffer.concat(chunks);
 
     // Model list endpoint — serve the LIVE Anthropic model list so newly
@@ -1251,6 +1290,39 @@ process.on('uncaughtException', (e) => {
 process.on('unhandledRejection', (e) => {
   console.error(`[PROXY] unhandledRejection (kept alive): ${e && e.stack ? e.stack : e}`);
 });
+
+// Graceful shutdown. SIGTERM (Docker / k8s) and SIGINT (Ctrl-C) get the same
+// treatment: stop accepting new connections, drain in-flight ones, flush the
+// structured JSONL log stream, then exit. Without this, the last few access
+// log lines and any in-flight response chunks get truncated mid-write
+// (PHA-1844 audit, M2).
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[PROXY] ${signal} received — draining connections and flushing logs`);
+  // Force-exit after 15s if drain stalls (e.g. a hung client that never reads).
+  const forceExit = setTimeout(() => {
+    console.error('[PROXY] graceful shutdown timed out after 15s — forcing exit');
+    process.exit(1);
+  }, 15000);
+  forceExit.unref();
+  server.close(() => {
+    if (logFileStream) {
+      logFileStream.end(() => {
+        console.log('[PROXY] LOG_FILE flushed');
+        process.exit(0);
+      });
+    } else {
+      process.exit(0);
+    }
+  });
+  // close() waits for connections to end on their own; nudge sockets so
+  // idle-keepalive clients release promptly.
+  if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.listen(PORT, '0.0.0.0', () => {
   const proto = USE_HTTPS ? 'https' : 'http';
