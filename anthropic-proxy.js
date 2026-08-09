@@ -1420,7 +1420,16 @@ const handler = (req, res) => {
           res.on('drain', () => {
             if (upstreamPaused) { upstreamPaused = false; upRes.resume(); }
           });
+          // Client hung up (or the idle timeout ended us) before the turn
+          // finished: stop pulling the upstream stream. Without this we keep
+          // reading — and being billed for — a reply nobody will read, and a
+          // LiteLLM-side cancellation leaks an upstream socket per request.
+          let streamDone = false;
+          res.on('close', () => {
+            if (!streamDone) { try { upRes.destroy(); } catch (_) {} try { upstreamReq.destroy(); } catch (_) {} }
+          });
           const finishStream = () => {
+            streamDone = true;
             usageWatcher.flush();
             logUsageAcc = usageWatcher.get();
             try { res.end(); } catch (_) {}
