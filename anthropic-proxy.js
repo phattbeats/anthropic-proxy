@@ -352,20 +352,58 @@ function mapOpenAIToolChoice(tool_choice) {
 }
 
 // OpenAI message content (string or array of {type:'text'|'image_url', ...})
-// → Anthropic content blocks. Non-text/image parts are dropped.
+// → Anthropic content blocks. text → text, image_url → image (base64 / URL
+// source). Anything else: log once per type and skip so a noisy client with
+// many unsupported parts doesn't drown the log.
+const _warnedUnsupportedContentTypes = new Set();
 function mapOpenAIContentParts(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.map(part => {
+  const out = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
     if (part.type === 'text') {
       const block = { type: 'text', text: part.text };
       // Preserve a client-supplied cache breakpoint — rebuilding the block from
       // scratch silently dropped it, which is why nothing cached on this path.
       if (part.cache_control) block.cache_control = part.cache_control;
-      return block;
+      out.push(block);
+      continue;
     }
-    return part;
-  });
+    if (part.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string') {
+      const url = part.image_url.url;
+      if (url.startsWith('data:')) {
+        // data:[<media_type>][;base64],<data> — the header end is the first
+        // comma (the data separator); the media_type is the header before the
+        // first ';' (drops ;base64, ;charset=, etc.).
+        const comma = url.indexOf(',', 5);
+        if (comma >= 0) {
+          const header = url.slice(5, comma);
+          const data = url.slice(comma + 1);
+          const semi = header.indexOf(';');
+          const media_type = semi >= 0 ? header.slice(0, semi) : header;
+          out.push({ type: 'image', source: { type: 'base64', media_type, data } });
+          continue;
+        }
+        // Malformed data: URL (no comma) — fall through to the unsupported-skip below.
+      } else if (url.startsWith('http://') || url.startsWith('https://')) {
+        // Anthropic requires the URL to be reachable from Anthropic's servers
+        // (their infra fetches it). Arbitrary web URLs may time out or 403, so
+        // warn — but still pass through so the client controls the request.
+        console.log(`[PROXY] passing through image URL source (must be reachable from Anthropic's servers): ${url}`);
+        out.push({ type: 'image', source: { type: 'url', url } });
+        continue;
+      }
+      // image_url with unknown scheme or malformed data URL — fall through.
+    }
+    // Unsupported part type (or unsupported image_url variant). Log once per type.
+    const t = part.type || 'unknown';
+    if (!_warnedUnsupportedContentTypes.has(t)) {
+      console.log(`[PROXY] ignoring unsupported OpenAI content part: ${t}`);
+      _warnedUnsupportedContentTypes.add(t);
+    }
+  }
+  return out;
 }
 
 // Find the cache breakpoint a client attached to one message. OpenAI's wire
@@ -1439,4 +1477,4 @@ server.listen(PORT, '0.0.0.0', () => {
 // Test seam only. When the proxy is started normally (`node anthropic-proxy.js`)
 // require.main === module, so this is a no-op and nothing above it changes.
 // scripts/pha1596-usage-unit.js requires the file to unit-test the pure helpers.
-if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS };
+if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, mapOpenAIContentParts, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS };
