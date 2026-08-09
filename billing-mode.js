@@ -56,12 +56,21 @@ try {
   }
 } catch (e) { /* missing/invalid config.json → leave ACCOUNT_UUID empty */ }
 
-// Last upstream request-id, used to emit the modern `cc_prev_req` billing-header
-// chain field genuine CC 2.1.205 sends on consecutive first-party requests. A
-// static header that never chains is itself a tell. Set by the core proxy from
-// each upstream response's request-id header via setLastRequestId().
-let LAST_REQUEST_ID = null;
-function setLastRequestId(id) { if (id) LAST_REQUEST_ID = id; }
+// Last upstream request-id per session, used to emit the modern `cc_prev_req`
+// billing-header chain field genuine CC 2.1.205 sends on consecutive first-party
+// requests. A static header that never chains is itself a tell. Keyed by session
+// (rather than one shared global) so cc_prev_req chains a request to its own
+// session's prior request instead of racing across concurrent sessions. Set by
+// the core proxy from each upstream response's request-id header via
+// setLastRequestId().
+const LAST_REQUEST_ID_BY_SESSION = new Map();
+function setLastRequestId(id, sessionId) {
+  if (!id) return;
+  LAST_REQUEST_ID_BY_SESSION.set(sessionId || INSTANCE_SESSION_ID, id);
+}
+function getLastRequestId(sessionId) {
+  return LAST_REQUEST_ID_BY_SESSION.get(sessionId || INSTANCE_SESSION_ID) || null;
+}
 
 // Beta flags — EXACT list + order captured from genuine Claude Code 2.1.205
 // (openclaw-billing-proxy PR #61, capture-and-diff 2026-07-16). A merged/reordered
@@ -99,13 +108,13 @@ const REPLACEMENTS = [
   ['Prometheus', 'PAssistant'], ['prometheus', 'passistant'],
   ['clawhub.com', 'skillhub.example.com'], ['clawhub', 'skillhub'],
   ['clawd', 'agentd'], ['lossless-claw', 'lossless-ctx'],
-  ['third-party', 'external'], ['billing proxy', 'routing layer'],
+  ['billing proxy', 'routing layer'],
   ['billing-proxy', 'routing-layer'],
   ['x-anthropic-billing-header', 'x-routing-config'],
   ['x-anthropic-billing', 'x-routing-cfg'],
   ['cch=00000', 'cfg=00000'], ['cc_version', 'rt_version'],
   ['cc_entrypoint', 'rt_entrypoint'], ['billing header', 'routing config'],
-  ['extra usage', 'usage quota'], ['assistant platform', 'ocplatform'],
+  ['assistant platform', 'ocplatform'],
 ];
 
 const TOOL_RENAMES = [
@@ -141,13 +150,12 @@ const REVERSE_MAP = [
   ['PAssistant', 'Prometheus'], ['passistant', 'prometheus'],
   ['skillhub.example.com', 'clawhub.com'], ['skillhub', 'clawhub'],
   ['agentd', 'clawd'], ['lossless-ctx', 'lossless-claw'],
-  ['external', 'third-party'], ['routing layer', 'billing proxy'],
+  ['routing layer', 'billing proxy'],
   ['routing-layer', 'billing-proxy'],
   ['x-routing-config', 'x-anthropic-billing-header'],
   ['x-routing-cfg', 'x-anthropic-billing'],
   ['cfg=00000', 'cch=00000'], ['rt_version', 'cc_version'],
   ['rt_entrypoint', 'cc_entrypoint'], ['routing config', 'billing header'],
-  ['usage quota', 'extra usage'],
 ];
 
 function computeBillingFingerprint(firstUserText) {
@@ -188,20 +196,28 @@ function extractFirstUserText(bodyStr) {
     .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 }
 
-function buildBillingBlock(bodyStr) {
+// Genuine CC 2.1.205 (sdk-cli mode, captured 2026-07-16 for openclaw PR #61) sends
+// this as an HTTP header, not a body block:
+//   x-anthropic-billing-header: cc_version=<v.fp>; cc_entrypoint=sdk-cli;[ cc_prev_req=<id>;]
+// No `cch` field in this mode, and cc_entrypoint must match the user-agent (sdk-cli).
+// The prev-request chain only appears once there is a prior request-id to chain.
+//
+// PHA-1842: this used to be injected as system[0] in the request body, which put an
+// ever-changing value (cc_prev_req + the 6h-rotating cc_version) at the front of the
+// cache-control prefix chain — invalidating every prompt-cache breakpoint on every
+// request. Anthropic's own cache is prefix-based (tools -> system -> messages), so
+// this must go out as a real header instead, leaving the system array byte-stable.
+//
+// NOTE (PHA-1389): this flips cc_entrypoint cli→sdk-cli. Our prior model (see the
+// June-15 surcharge memo) matched genuine INTERACTIVE cli; the current detection
+// matches genuine 2.1.205, which runs sdk-cli, and PR #61 verified sdk-cli returns
+// 200 with zero extra-usage. Realigning to genuine is what clears the block.
+function buildBillingHeaderValue(bodyStr, sessionId) {
   const firstText = extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
-  // Genuine CC 2.1.205 (sdk-cli mode, captured 2026-07-16 for openclaw PR #61) emits:
-  //   "x-anthropic-billing-header: cc_version=<v.fp>; cc_entrypoint=sdk-cli;[ cc_prev_req=<id>;]"
-  // No `cch` field in this mode, and cc_entrypoint must match the user-agent (sdk-cli).
-  // The prev-request chain only appears once there is a prior request-id to chain.
-  //
-  // NOTE (PHA-1389): this flips cc_entrypoint cli→sdk-cli. Our prior model (see the
-  // June-15 surcharge memo) matched genuine INTERACTIVE cli; the current detection
-  // matches genuine 2.1.205, which runs sdk-cli, and PR #61 verified sdk-cli returns
-  // 200 with zero extra-usage. Realigning to genuine is what clears the block.
-  const prev = LAST_REQUEST_ID ? ` cc_prev_req=${LAST_REQUEST_ID};` : '';
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;${prev}"}`;
+  const prevId = getLastRequestId(sessionId);
+  const prev = prevId ? ` cc_prev_req=${prevId};` : '';
+  return `cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;${prev}`;
 }
 
 // Resolve the session id for a request. Prefer the client's own per-conversation
@@ -359,29 +375,6 @@ function processBody(bodyStr, sessionId) {
       section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
       m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
     }
-  }
-
-  // Layer 1: Billing fingerprint block injection into system array
-  const BILLING_BLOCK = buildBillingBlock(m);
-  const sysArrayIdx = m.indexOf('"system":[');
-  if (sysArrayIdx !== -1) {
-    const insertAt = sysArrayIdx + '"system":['.length;
-    m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
-  } else if (m.includes('"system":"')) {
-    const sysStart = m.indexOf('"system":"');
-    let i = sysStart + '"system":"'.length;
-    while (i < m.length) {
-      if (m[i] === '\\') { i += 2; continue; }
-      if (m[i] === '"') break;
-      i++;
-    }
-    const sysEnd = i + 1;
-    const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
-    m = m.slice(0, sysStart)
-      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
-      + m.slice(sysEnd);
-  } else {
-    m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
   }
 
   // Metadata injection
@@ -682,6 +675,7 @@ module.exports = {
   loadOAuthToken,
   refreshTokenIfStale,
   buildBillingHeaders,
+  buildBillingHeaderValue,
   deriveSessionId,
   setCCVersion,
   setLastRequestId,
