@@ -498,22 +498,44 @@ function refreshTokenIfStale(cached) {
   }
 }
 
+// PHA-1848 (M6, audit finding): this used to copy every client-supplied header
+// onto the outbound request EXCEPT a small denylist (host/connection/
+// authorization/x-api-key/content-length/x-session-affinity). That is a
+// client-header-injection vulnerability: any header a client sent -- a spoofed
+// `anthropic-beta`, a custom `x-stainless-*` override, an unexpected
+// `anthropic-version`, or literally anything else -- rode along on a request
+// that is authenticated as the PROXY's own OAuth identity. The denylist only
+// blocked the one or two headers someone happened to think of; everything
+// else was trusted by default.
+//
+// Audit of what this function actually needs from the client (existingHeaders):
+// only the session-id hint (`x-claude-code-session-id` / `x-session-id`), and
+// that is never copied verbatim -- it's read by deriveSessionId(), validated
+// against a strict hex/UUID-shaped regex, and re-emitted as a canonical header
+// by getStainlessHeaders() below. Every other outbound header in this function
+// is a fixed, server-controlled value (authorization, accept-encoding,
+// anthropic-version, the full stainless/user-agent block, anthropic-beta).
+// There is no legitimate reason to forward ANY raw client header to Anthropic
+// in billing mode, so the allowlist is empty by design -- we build the request
+// entirely from values the proxy controls instead of copy-then-strip.
+const BILLING_HEADER_ALLOWLIST = Object.freeze([]);
+
 function buildBillingHeaders(oauthToken, existingHeaders, sessionId) {
   const headers = {};
-  for (const [key, value] of Object.entries(existingHeaders || {})) {
-    const lk = key.toLowerCase();
-    if (lk === 'host' || lk === 'connection' || lk === 'authorization'
-        || lk === 'x-api-key' || lk === 'content-length'
-        || lk === 'x-session-affinity') continue;
-    headers[key] = value;
+  for (const key of BILLING_HEADER_ALLOWLIST) {
+    const value = (existingHeaders || {})[key];
+    if (value !== undefined) headers[key] = value;
   }
   headers['authorization'] = `Bearer ${oauthToken}`;
   headers['accept-encoding'] = 'identity';
   headers['anthropic-version'] = '2023-06-01';
+  // sessionId, once resolved, only ever came from deriveSessionId()'s
+  // regex-validated read of existingHeaders (see comment above) -- never a raw
+  // copy -- before being re-emitted below as the canonical header name.
   Object.assign(headers, getStainlessHeaders(sessionId || deriveSessionId(existingHeaders)));
   // Override the beta header WHOLESALE with the genuine 2.1.205 list/order. A merged
   // set that keeps client-specific betas (or reorders) is itself a fingerprint
-  // (openclaw PR #61); genuine CC replaces the header wholesale, so we do too.
+  // (ocplatform PR #61); genuine CC replaces the header wholesale, so we do too.
   headers['anthropic-beta'] = REQUIRED_BETAS.join(',');
   return headers;
 }
