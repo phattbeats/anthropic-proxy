@@ -773,6 +773,37 @@ function extractAnthropicErrorType(raw) {
   return null;
 }
 
+// PHA-1860: Anthropic reports subscription quota on EVERY response via
+// `anthropic-ratelimit-unified-*` headers, on 200s and 429s alike. Without
+// them in the access log, a quota-shed 429 is indistinguishable from a proxy
+// bug — which is exactly the wrong turn this issue took: six `rate_limit_error`
+// lines with zero tokens read as a regression between 1.4.7 and 1.5.0, when
+// the account was simply at 0.95 of its 7-day limit with org-level overage
+// disabled. Past `surpassed-threshold`, Anthropic sheds a FRACTION of requests
+// (`fallback-percentage`) rather than blocking outright, so successes and 429s
+// interleave and it looks nondeterministic. Logging utilization + reset makes
+// the real cause legible on the first line of output.
+function extractQuota(headers) {
+  if (!headers) return null;
+  const h = n => headers[`anthropic-ratelimit-unified-${n}`];
+  const num = n => { const v = parseFloat(h(n)); return Number.isFinite(v) ? v : undefined; };
+  const q = {
+    status: h('status'),
+    util5h: num('5h-utilization'),
+    util7d: num('7d-utilization'),
+    // Which window Anthropic is actually enforcing against right now.
+    claim: h('representative-claim'),
+    // Fraction of requests shed once past the threshold; presence of this with
+    // a non-`allowed` status is the signature of quota shedding.
+    shed: num('fallback-percentage'),
+    overage: h('overage-status'),
+  };
+  const reset = parseInt(h('reset'), 10);
+  if (Number.isFinite(reset)) q.resetsAt = new Date(reset * 1000).toISOString();
+  for (const k of Object.keys(q)) if (q[k] === undefined) delete q[k];
+  return Object.keys(q).length ? q : null;
+}
+
 // Returns a normalized usage object when usage was present, else null — callers
 // use this to feed the per-request structured access log without re-parsing.
 function logUsageFromAnthropic(raw, model) {
@@ -911,6 +942,8 @@ const handler = (req, res) => {
   // Anthropic error.type — distinguishes "0 tokens because upstream 429" (no
   // usage field on rate-limit errors) from "0 tokens because logging bug".
   let logErrorType = null;
+  // Subscription quota snapshot from the upstream response headers (PHA-1860).
+  let logQuota = null;
   res.on('finish', () => {
     const entry = {
       ts: new Date().toISOString(),
@@ -928,6 +961,7 @@ const handler = (req, res) => {
       cacheCreation1h: logUsageAcc.cache1h,
     };
     if (logErrorType) entry.errorType = logErrorType;
+    if (logQuota) entry.quota = logQuota;
     logAccess(entry);
   });
 
@@ -1111,6 +1145,7 @@ const handler = (req, res) => {
       const proxyReq = https.request(options, proxyRes => {
         // Track upstream request-id to chain the next request's cc_prev_req header.
         if (BILLING_MODE) billing.setLastRequestId(proxyRes.headers['request-id'] || proxyRes.headers['anthropic-request-id'], billingSessionId);
+        logQuota = extractQuota(proxyRes.headers);
         // Upstream rejected the request (overloaded/rate-limit/auth) — the body
         // is a JSON error, not SSE, even when the client asked for streaming.
         // Relay it as an OpenAI-shape JSON error with the real status so
@@ -1365,6 +1400,7 @@ const handler = (req, res) => {
         method: 'POST', headers,
       }, upRes => {
         if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id'], billingSessionId);
+        logQuota = extractQuota(upRes.headers);
         if (isStream) {
           // PHA-1860: REVERTS PHA-1850 (M5) on this path. M5 buffered the entire
           // upstream SSE reply so it could send a real Content-Length instead of

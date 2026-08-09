@@ -104,6 +104,18 @@ const waitForListen = () => new Promise((resolve, reject) => {
   assert.ok(result.text.includes('message_stop'), 'message_stop missing');
   ok('full reply delivered intact (tail + emoji + message_stop)');
 
+  // The access log is written on res 'finish'; give it a tick to land.
+  await new Promise(r => setTimeout(r, 100));
+  const logLine = proxyLog.split('\n').filter(l => l.includes('"route":"/v1/messages"')).pop();
+  assert.ok(logLine, 'expected an access-log line for /v1/messages');
+  const entry = JSON.parse(logLine);
+  assert.ok(entry.quota, 'access log must carry the upstream quota snapshot');
+  assert.strictEqual(entry.quota.util7d, 0.95, 'weekly utilization must reach the log');
+  assert.strictEqual(entry.quota.shed, 0.5, 'shed rate must reach the log');
+  assert.strictEqual(entry.quota.claim, 'seven_day', 'enforced window must reach the log');
+  assert.strictEqual(entry.quota.resetsAt, '2026-08-10T01:00:00.000Z', 'reset must reach the log');
+  ok('access log carries quota snapshot (util7d=0.95, shed=0.5, resets 01:00Z)');
+
   console.log('\nPHA-1860 stream canary: PASS');
   cleanup(0);
 })().catch(e => {
