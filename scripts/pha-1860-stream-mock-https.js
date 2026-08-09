@@ -55,6 +55,13 @@ https.request = function patchedRequest(options, callback) {
         'transfer-encoding': 'chunked',
         'anthropic-request-id': 'req_pha1860_mock',
         'request-id': 'req_pha1860_mock',
+        // Quota headers Anthropic sends on every response; the canary asserts
+        // they reach the access log as a `quota` field (PHA-1860).
+        'anthropic-ratelimit-unified-status': 'allowed_warning',
+        'anthropic-ratelimit-unified-7d-utilization': '0.95',
+        'anthropic-ratelimit-unified-representative-claim': 'seven_day',
+        'anthropic-ratelimit-unified-fallback-percentage': '0.5',
+        'anthropic-ratelimit-unified-reset': '1786323600',
       };
       upRes.pause = () => {};
       upRes.resume = () => {};
