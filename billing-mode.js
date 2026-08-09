@@ -586,11 +586,15 @@ function rebuildSSEEvent(parsed, newObj) {
   return parsed.prefix + 'data: ' + JSON.stringify(newObj) + parsed.suffix;
 }
 
+const isHighSurrogate = (c) => c >= 0xd800 && c <= 0xdbff;
+const isLowSurrogate = (c) => c >= 0xdc00 && c <= 0xdfff;
+
 function createBufferedSSETransformer(reverseMapFn, carryLen) {
   const decoder = new StringDecoder('utf8');
   let pending = '';
   let currentBlockIsThinking = false;
   let textCarry = '';
+  let lastTextIndex = 0;
 
   // textCarry always holds ALREADY reverse-mapped text (see the text_delta path
   // below, which stores mapped.slice(...)). Do NOT re-map it here — a second pass
@@ -627,13 +631,26 @@ function createBufferedSSETransformer(reverseMapFn, carryLen) {
     if (obj.type === 'content_block_delta' &&
         obj.delta && obj.delta.type === 'text_delta' &&
         !currentBlockIsThinking) {
+      lastTextIndex = obj.index;
       const combined = textCarry + obj.delta.text;
       const mapped = reverseMapFn(combined);
       if (mapped.length <= carryLen - 1) {
         textCarry = mapped;
         return '';
       }
-      const safeEmitLen = mapped.length - (carryLen - 1);
+      // JS strings are UTF-16 code units, so a naive slice can land BETWEEN a
+      // surrogate pair (any emoji / astral char). That leaves a lone high
+      // surrogate at the end of toEmit and a lone low surrogate at the start of
+      // textCarry; JSON.stringify happily encodes them as \udXXX, and strict
+      // UTF-8 consumers (LiteLLM / pydantic-core) reject the whole chunk with
+      // "str is not valid UTF-8: surrogates not allowed" — killing the stream
+      // mid-generation (PHA-1860). Back the split up one unit when it splits a pair.
+      let safeEmitLen = mapped.length - (carryLen - 1);
+      if (safeEmitLen > 0 && isHighSurrogate(mapped.charCodeAt(safeEmitLen - 1))
+          && isLowSurrogate(mapped.charCodeAt(safeEmitLen))) {
+        safeEmitLen -= 1;
+      }
+      if (safeEmitLen <= 0) { textCarry = mapped; return ''; }
       const toEmit = mapped.slice(0, safeEmitLen);
       textCarry = mapped.slice(safeEmitLen);
       const newObj = { ...obj, delta: { ...obj.delta, text: toEmit } };
@@ -671,10 +688,11 @@ function createBufferedSSETransformer(reverseMapFn, carryLen) {
       if (pending.length > 0) out += processEvent(pending);
       // Any tail still buffered here is an abnormal end (no content_block_stop).
       // textCarry is already reverse-mapped — emit as-is, don't map twice.
-      if (textCarry.length > 0) {
-        out += textCarry;
-        textCarry = '';
-      }
+      // It must still go out as a well-formed text_delta event: appending the
+      // raw tail to the stream produced a bare, unparseable line that clients
+      // drop (and that trips strict SSE parsers), so the last few chars of the
+      // reply vanished on any stream that ended without content_block_stop.
+      if (textCarry.length > 0) out += flushCarryAsDelta(lastTextIndex);
       return out;
     },
   };

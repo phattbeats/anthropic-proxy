@@ -20,6 +20,10 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+// Decoding SSE chunks with chunk.toString() corrupts any multi-byte character
+// that straddles a TCP chunk boundary. StringDecoder holds the partial bytes
+// until the rest arrives (PHA-1860).
+const { StringDecoder } = require('string_decoder');
 
 const PROXY_DIR = __dirname;
 const USE_HTTPS = fs.existsSync(path.join(PROXY_DIR, 'proxy-key.pem'));
@@ -776,9 +780,10 @@ function makeSSEUsageWatcher(model) {
   let buffer = '';
   let usage = { ...EMPTY_USAGE };
   let logged = false;
+  const decoder = new StringDecoder('utf8');
   return {
     feed(chunk) {
-      buffer += chunk.toString();
+      buffer += decoder.write(chunk);
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
       for (const line of lines) {
@@ -1153,6 +1158,7 @@ const handler = (req, res) => {
           let nextToolCallIndex = 0;
           // In billing mode, reverse-map each SSE event before re-parsing.
           const xform = BILLING_MODE ? billing.createSSETransformer() : null;
+          const rawDecoder = xform ? null : new StringDecoder('utf8');
           const handleLines = (text) => {
             buffer += text;
             const lines = buffer.split('\n');
@@ -1234,14 +1240,12 @@ const handler = (req, res) => {
             }
           };
           proxyRes.on('data', chunk => {
-            const text = xform ? xform.onData(chunk) : chunk.toString();
+            const text = xform ? xform.onData(chunk) : rawDecoder.write(chunk);
             if (text) handleLines(text);
           });
           proxyRes.on('end', () => {
-            if (xform) {
-              const tail = xform.onEnd();
-              if (tail) handleLines(tail);
-            }
+            const tail = xform ? xform.onEnd() : rawDecoder.end();
+            if (tail) handleLines(tail);
             if (usage.input || usage.output || usage.cacheCreate || usage.cacheRead) logUsage(model, usage);
             logUsageAcc = usage;
             res.end();
@@ -1392,13 +1396,14 @@ const handler = (req, res) => {
               console.error('[PROXY] createSSETransformer returned invalid transformer; passing SSE through unmapped');
               xform = null;
             }
+            const rawDecoder = xform ? null : new StringDecoder('utf8');
             upRes.on('data', chunk => {
               usageWatcher.feed(chunk);
-              const out = xform ? xform.onData(chunk) : chunk.toString();
+              const out = xform ? xform.onData(chunk) : rawDecoder.write(chunk);
               if (out) outParts.push(out);
             });
             upRes.on('end', () => {
-              const tail = xform ? xform.onEnd() : '';
+              const tail = xform ? xform.onEnd() : rawDecoder.end();
               if (tail) outParts.push(tail);
               flushBuffered();
             });
