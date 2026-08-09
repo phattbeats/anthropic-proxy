@@ -886,8 +886,14 @@ const handler = (req, res) => {
         res.writeHead(400);
         return res.end(JSON.stringify({ error: 'Bad request body: ' + e.message }));
       }
-      // In billing mode, run the body through the 8-layer transformer
-      if (BILLING_MODE) bodyStr = billing.processBody(bodyStr, billingSessionId);
+      // In billing mode, run the body through the transformer, then derive the
+      // billing header from the processed body (PHA-1842: this used to be injected
+      // as system[0] in the body, which broke prompt-cache prefix matching on every
+      // request — it now goes out as a real header, leaving the body byte-stable).
+      if (BILLING_MODE) {
+        bodyStr = billing.processBody(bodyStr, billingSessionId);
+        headers['x-anthropic-billing-header'] = billing.buildBillingHeaderValue(bodyStr, billingSessionId);
+      }
       const bodyBuf = Buffer.from(bodyStr);
       headers['content-length'] = String(bodyBuf.length);
 
@@ -903,7 +909,7 @@ const handler = (req, res) => {
       };
       const proxyReq = https.request(options, proxyRes => {
         // Track upstream request-id to chain the next request's cc_prev_req header.
-        if (BILLING_MODE) billing.setLastRequestId(proxyRes.headers['request-id'] || proxyRes.headers['anthropic-request-id']);
+        if (BILLING_MODE) billing.setLastRequestId(proxyRes.headers['request-id'] || proxyRes.headers['anthropic-request-id'], billingSessionId);
         // Upstream rejected the request (overloaded/rate-limit/auth) — the body
         // is a JSON error, not SSE, even when the client asked for streaming.
         // Relay it as an OpenAI-shape JSON error with the real status so
@@ -1106,8 +1112,12 @@ const handler = (req, res) => {
       const sourceBodyStr = parsed ? JSON.stringify(parsed) : rawBody.toString();
 
       if (BILLING_MODE) {
-        // Billing mode: run full request transformation pipeline (8 layers)
-        bodyBuf = Buffer.from(billing.processBody(sourceBodyStr, billingSessionId));
+        // Billing mode: run full request transformation pipeline, then derive the
+        // billing header from the processed body (PHA-1842: as a real header, not
+        // body block, so system/message cache_control prefixes stay byte-stable).
+        const billingProcessedStr = billing.processBody(sourceBodyStr, billingSessionId);
+        headers['x-anthropic-billing-header'] = billing.buildBillingHeaderValue(billingProcessedStr, billingSessionId);
+        bodyBuf = Buffer.from(billingProcessedStr);
       } else if (parsed) {
         // Regular mode: inject Claude Code system prompt for OAuth + cap cache_control
         if (isOAuth) {
@@ -1134,7 +1144,7 @@ const handler = (req, res) => {
         path: BILLING_MODE ? '/v1/messages?beta=true' : '/v1/messages',
         method: 'POST', headers,
       }, upRes => {
-        if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id']);
+        if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id'], billingSessionId);
         if (isStream) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];
