@@ -1252,25 +1252,33 @@ const handler = (req, res) => {
       }, upRes => {
         if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id'], billingSessionId);
         if (isStream) {
-          const sseHeaders = { ...upRes.headers };
-          delete sseHeaders['content-length'];
-          delete sseHeaders['transfer-encoding'];
-          res.writeHead(upRes.statusCode, sseHeaders);
-          attachStreamIdleTimeout(res, 'POST /v1/messages SSE passthrough');
-          // H3 (PHA-1844): honor backpressure. sseWrite returns false when the
-          // downstream kernel buffer is saturated; on false we pause upRes and
-          // resume on 'drain'. This bounds per-connection memory under slow
-          // clients, same shape as the chat/completions path.
-          let upstreamPaused = false;
-          const sseWrite = (chunk) => {
-            const ok = res.write(chunk);
-            if (ok === false && !upstreamPaused) { upstreamPaused = true; upRes.pause(); }
-            return ok;
+          // PHA-1850 (M5): buffer the full upstream SSE reply and send a real
+          // Content-Length on the initial writeHead, instead of relaying as
+          // implicit chunked transfer. Genuine Claude Code 2.1.x sends
+          // Content-Length on streaming /v1/messages replies (it matches the
+          // byte length of the fully-flushed final frame); deleting both
+          // content-length and transfer-encoding here was both a fingerprint
+          // tell and an inconsistency with Anthropic-side framing. Mirrors the
+          // billing-mode buffered-transformer pattern (PHA-1387): accumulate
+          // every transformed/passthrough chunk, then flush once as a single
+          // deterministic write. Trades incremental delivery to the client for
+          // framing parity — acceptable per PHA-1844c scope; the existing
+          // upstream timeout (attachUpstreamTimeout on upstreamReq, below)
+          // still guards against a stalled/hung upstream during buffering.
+          const usageWatcher = makeSSEUsageWatcher(model);
+          const outParts = [];
+          const flushBuffered = () => {
+            usageWatcher.flush();
+            logUsageAcc = usageWatcher.get();
+            const body = Buffer.isBuffer(outParts[0]) || outParts.length === 0
+              ? Buffer.concat(outParts.map(p => (Buffer.isBuffer(p) ? p : Buffer.from(p))))
+              : Buffer.from(outParts.join(''));
+            const sseHeaders = { ...upRes.headers };
+            delete sseHeaders['transfer-encoding'];
+            sseHeaders['content-length'] = String(body.length);
+            res.writeHead(upRes.statusCode, sseHeaders);
+            res.end(body);
           };
-          res.on('drain', () => {
-            if (upstreamPaused) { upstreamPaused = false; upRes.resume(); }
-          });
-                    const usageWatcher = makeSSEUsageWatcher(model);
           if (BILLING_MODE) {
             // Guard against createSSETransformer returning a bad value (a botched
             // build once shipped a body-less wrapper that returned undefined and
@@ -1284,26 +1292,23 @@ const handler = (req, res) => {
             upRes.on('data', chunk => {
               usageWatcher.feed(chunk);
               const out = xform ? xform.onData(chunk) : chunk.toString();
-              if (out) sseWrite(out);
+              if (out) outParts.push(out);
             });
             upRes.on('end', () => {
               const tail = xform ? xform.onEnd() : '';
-              if (tail) sseWrite(tail);
-              usageWatcher.flush();
-              logUsageAcc = usageWatcher.get();
-              res.end();
+              if (tail) outParts.push(tail);
+              flushBuffered();
             });
           } else {
-            upRes.on('data', chunk => { usageWatcher.feed(chunk); sseWrite(chunk); });
-            upRes.on('end', () => {
-              usageWatcher.flush();
-              logUsageAcc = usageWatcher.get();
-              res.end();
-            });
+            upRes.on('data', chunk => { usageWatcher.feed(chunk); outParts.push(chunk); });
+            upRes.on('end', () => { flushBuffered(); });
           }
           upRes.on('error', e => {
             console.error(`[PROXY] /v1/messages SSE upstream error: ${e.message}`);
-            if (res.writable) res.end();
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: e.message }));
+            } else if (res.writable) res.end();
           });
         } else {
           let respChunks = [];
