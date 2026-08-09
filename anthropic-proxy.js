@@ -738,6 +738,24 @@ function logUsage(model, u) {
   const ttlStr = ttl.length ? ` (${ttl.join(' ')})` : '';
   console.log(`[USAGE] model=${model} in=${usage.input || 0} out=${usage.output || 0} cache_write=${usage.cacheCreate || 0}${ttlStr} cache_read=${usage.cacheRead || 0} | totals: req=${totalReq} in=${totalIn} out=${totalOut} cache_write=${totalCacheCreate} cache_read=${totalCacheRead}`);
 }
+// Pull the Anthropic error type out of a JSON error body so the structured
+// access log can record WHY a request returned 0 tokens (e.g. rate_limit_error
+// has no usage field — that's normal, not a logging bug). Tolerant of
+// malformed bodies and billing-mode reverse-mapped output.
+function extractAnthropicErrorType(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  // Trim a possible SSE prefix in case the body leaked through the streaming path.
+  const trimmed = raw.replace(/^data:\s*/, '').trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed.error === 'object' && typeof parsed.error.type === 'string') {
+      return parsed.error.type;
+    }
+  } catch (_) {}
+  return null;
+}
+
 // Returns a normalized usage object when usage was present, else null — callers
 // use this to feed the per-request structured access log without re-parsing.
 function logUsageFromAnthropic(raw, model) {
@@ -871,8 +889,12 @@ const handler = (req, res) => {
   // so every route (including early returns, errors, passthrough) logs.
   let logModel = null;
   let logUsageAcc = { ...EMPTY_USAGE };
+  // Set when the upstream returned a non-2xx and the JSON body carried an
+  // Anthropic error.type — distinguishes "0 tokens because upstream 429" (no
+  // usage field on rate-limit errors) from "0 tokens because logging bug".
+  let logErrorType = null;
   res.on('finish', () => {
-    logAccess({
+    const entry = {
       ts: new Date().toISOString(),
       id: requestId,
       method: req.method,
@@ -886,7 +908,9 @@ const handler = (req, res) => {
       cacheReadTokens: logUsageAcc.cacheRead,
       cacheCreation5m: logUsageAcc.cache5m,
       cacheCreation1h: logUsageAcc.cache1h,
-    });
+    };
+    if (logErrorType) entry.errorType = logErrorType;
+    logAccess(entry);
   });
 
   // Hard cap on inbound request body. Without this a single client can POST
@@ -1079,9 +1103,11 @@ const handler = (req, res) => {
           proxyRes.on('end', () => {
             let buf = Buffer.concat(errChunks);
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
+            const raw = buf.toString();
+            logErrorType = extractAnthropicErrorType(raw) || `upstream_${proxyRes.statusCode}`;
             let body;
-            try { body = anthropicErrorToOpenAI(JSON.parse(buf.toString())); }
-            catch (e) { body = JSON.stringify({ error: { message: buf.toString() || `upstream returned ${proxyRes.statusCode}`, type: 'server_error', code: null, param: null } }); }
+            try { body = anthropicErrorToOpenAI(JSON.parse(raw)); }
+            catch (e) { body = JSON.stringify({ error: { message: raw || `upstream returned ${proxyRes.statusCode}`, type: 'server_error', code: null, param: null } }); }
             console.error(`[PROXY] chat/completions upstream ${proxyRes.statusCode}: ${body}`);
             const eh = { 'Content-Type': 'application/json' };
             if (proxyRes.headers['retry-after']) eh['Retry-After'] = proxyRes.headers['retry-after'];
@@ -1344,6 +1370,12 @@ const handler = (req, res) => {
             const body = Buffer.isBuffer(outParts[0]) || outParts.length === 0
               ? Buffer.concat(outParts.map(p => (Buffer.isBuffer(p) ? p : Buffer.from(p))))
               : Buffer.from(outParts.join(''));
+            // Capture the upstream error type on the access log line so a 0-token
+            // /v1/messages entry is self-explanatory (rate_limit_error carries no
+            // usage field — that's not a logging bug, it's Anthropic's error shape).
+            if (upRes.statusCode >= 400) {
+              logErrorType = extractAnthropicErrorType(body.toString()) || `upstream_${upRes.statusCode}`;
+            }
             const sseHeaders = { ...upRes.headers };
             delete sseHeaders['transfer-encoding'];
             sseHeaders['content-length'] = String(body.length);
@@ -1390,6 +1422,9 @@ const handler = (req, res) => {
             const raw = buf.toString();
             const u = logUsageFromAnthropic(raw, model);
             if (u) logUsageAcc = u;
+            if (upRes.statusCode >= 400) {
+              logErrorType = extractAnthropicErrorType(raw) || `upstream_${upRes.statusCode}`;
+            }
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(buf);
@@ -1515,4 +1550,4 @@ server.listen(PORT, '0.0.0.0', () => {
 // Test seam only. When the proxy is started normally (`node anthropic-proxy.js`)
 // require.main === module, so this is a no-op and nothing above it changes.
 // scripts/pha1596-usage-unit.js requires the file to unit-test the pure helpers.
-if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, mapOpenAIContentParts, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS };
+if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, mapOpenAIContentParts, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS, extractAnthropicErrorType };
