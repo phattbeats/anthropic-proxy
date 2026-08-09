@@ -20,6 +20,10 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+// Decoding SSE chunks with chunk.toString() corrupts any multi-byte character
+// that straddles a TCP chunk boundary. StringDecoder holds the partial bytes
+// until the rest arrives (PHA-1860).
+const { StringDecoder } = require('string_decoder');
 
 const PROXY_DIR = __dirname;
 const USE_HTTPS = fs.existsSync(path.join(PROXY_DIR, 'proxy-key.pem'));
@@ -77,8 +81,15 @@ function attachUpstreamTimeout(req, label) {
 // chunk + a single log line. Reuses the same wrap-originals pattern as the
 // upstream attach*Timeout so the timeout handler can write the error chunk
 // without re-arming the timer (PHA-1844 audit, H3).
-const SSE_IDLE_TIMEOUT_MS = parseInt(process.env.SSE_IDLE_TIMEOUT_MS || '60000');
-function attachStreamIdleTimeout(res, label) {
+// PHA-1860: default raised 60s → 180s. Extended-thinking turns can go well past
+// a minute between visible deltas; a 60s ceiling turned a slow-but-healthy stream
+// into a mid-generation cutoff. Anthropic's own `ping` events keep a live stream
+// under this well before it fires.
+const SSE_IDLE_TIMEOUT_MS = parseInt(process.env.SSE_IDLE_TIMEOUT_MS || '180000');
+// `flavor` picks the shape of the terminating error frame: 'openai' (chat
+// completions chunk) or 'anthropic' (native /v1/messages `event: error`). A
+// client that can't parse the frame just sees a silent cutoff.
+function attachStreamIdleTimeout(res, label, flavor = 'openai') {
   if (!res || res.__sseIdleAttached) return;
   res.__sseIdleAttached = true;
   let timer = null;
@@ -87,12 +98,18 @@ function attachStreamIdleTimeout(res, label) {
     timer = setTimeout(() => {
       console.error(`[PROXY] SSE stream idle for ${SSE_IDLE_TIMEOUT_MS}ms (${label}); ending with stream error chunk`);
       try {
-        const errChunk = `data: ${JSON.stringify({
-          id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000), model: 'unknown',
-          choices: [{ index: 0, delta: {}, finish_reason: 'error' }],
-          error: { message: `stream idle timeout after ${SSE_IDLE_TIMEOUT_MS}ms`, type: 'idle_timeout', code: 'idle_timeout', param: null },
-        })}\n\n`;
+        const msg = `stream idle timeout after ${SSE_IDLE_TIMEOUT_MS}ms`;
+        const errChunk = flavor === 'anthropic'
+          ? `event: error\ndata: ${JSON.stringify({
+              type: 'error',
+              error: { type: 'api_error', message: msg },
+            })}\n\n`
+          : `data: ${JSON.stringify({
+              id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000), model: 'unknown',
+              choices: [{ index: 0, delta: {}, finish_reason: 'error' }],
+              error: { message: msg, type: 'idle_timeout', code: 'idle_timeout', param: null },
+            })}\n\n`;
         // Use the saved originals so the wrapped write/end isn't re-armed by
         // this final write. The subsequent end() also clears the timer.
         try { res.__origWrite(errChunk); } catch (_) {}
@@ -776,9 +793,10 @@ function makeSSEUsageWatcher(model) {
   let buffer = '';
   let usage = { ...EMPTY_USAGE };
   let logged = false;
+  const decoder = new StringDecoder('utf8');
   return {
     feed(chunk) {
-      buffer += chunk.toString();
+      buffer += decoder.write(chunk);
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
       for (const line of lines) {
@@ -1153,6 +1171,7 @@ const handler = (req, res) => {
           let nextToolCallIndex = 0;
           // In billing mode, reverse-map each SSE event before re-parsing.
           const xform = BILLING_MODE ? billing.createSSETransformer() : null;
+          const rawDecoder = xform ? null : new StringDecoder('utf8');
           const handleLines = (text) => {
             buffer += text;
             const lines = buffer.split('\n');
@@ -1234,14 +1253,12 @@ const handler = (req, res) => {
             }
           };
           proxyRes.on('data', chunk => {
-            const text = xform ? xform.onData(chunk) : chunk.toString();
+            const text = xform ? xform.onData(chunk) : rawDecoder.write(chunk);
             if (text) handleLines(text);
           });
           proxyRes.on('end', () => {
-            if (xform) {
-              const tail = xform.onEnd();
-              if (tail) handleLines(tail);
-            }
+            const tail = xform ? xform.onEnd() : rawDecoder.end();
+            if (tail) handleLines(tail);
             if (usage.input || usage.output || usage.cacheCreate || usage.cacheRead) logUsage(model, usage);
             logUsageAcc = usage;
             res.end();
@@ -1349,38 +1366,64 @@ const handler = (req, res) => {
       }, upRes => {
         if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id'], billingSessionId);
         if (isStream) {
-          // PHA-1850 (M5): buffer the full upstream SSE reply and send a real
-          // Content-Length on the initial writeHead, instead of relaying as
-          // implicit chunked transfer. Genuine Claude Code 2.1.x sends
-          // Content-Length on streaming /v1/messages replies (it matches the
-          // byte length of the fully-flushed final frame); deleting both
-          // content-length and transfer-encoding here was both a fingerprint
-          // tell and an inconsistency with Anthropic-side framing. Mirrors the
-          // billing-mode buffered-transformer pattern (PHA-1387): accumulate
-          // every transformed/passthrough chunk, then flush once as a single
-          // deterministic write. Trades incremental delivery to the client for
-          // framing parity — acceptable per PHA-1844c scope; the existing
-          // upstream timeout (attachUpstreamTimeout on upstreamReq, below)
-          // still guards against a stalled/hung upstream during buffering.
+          // PHA-1860: REVERTS PHA-1850 (M5) on this path. M5 buffered the entire
+          // upstream SSE reply so it could send a real Content-Length instead of
+          // implicit chunked. That framing is client-facing only — Anthropic never
+          // sees our RESPONSE framing, so it carried no anti-fingerprint value —
+          // while it did destroy incremental delivery: clients (LiteLLM, Claude
+          // Code) got zero bytes until the turn completed. Long turns tripped
+          // client-side stream timeouts, which put the deployment into LiteLLM
+          // cooldown and surfaced as immediate 429s, and killed streams mid-reply.
+          // Relay incrementally again, with backpressure + the per-stream idle
+          // timeout (H3, PHA-1844a) that M5 had also dropped here.
           const usageWatcher = makeSSEUsageWatcher(model);
-          const outParts = [];
-          const flushBuffered = () => {
+          // Non-2xx upstream replies to a stream request are a single JSON error
+          // body, not SSE. Buffer those so the error type reaches the access log
+          // and the client gets a well-framed JSON error (same shape as the
+          // chat/completions path).
+          if (upRes.statusCode >= 400) {
+            const errChunks = [];
+            upRes.on('data', c => errChunks.push(c));
+            upRes.on('end', () => {
+              let buf = Buffer.concat(errChunks);
+              if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
+              logErrorType = extractAnthropicErrorType(buf.toString()) || `upstream_${upRes.statusCode}`;
+              const eh = { ...upRes.headers };
+              delete eh['transfer-encoding'];
+              eh['content-length'] = String(buf.length);
+              res.writeHead(upRes.statusCode, eh);
+              res.end(buf);
+            });
+            upRes.on('error', e => {
+              console.error(`[PROXY] /v1/messages SSE upstream error: ${e.message}`);
+              if (!res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+              } else if (res.writable) res.end();
+            });
+            return;
+          }
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];
+          delete sseHeaders['transfer-encoding'];
+          res.writeHead(upRes.statusCode, sseHeaders);
+          attachStreamIdleTimeout(res, 'POST /v1/messages SSE', 'anthropic');
+          // Honor downstream backpressure: pause upstream when the kernel buffer
+          // saturates, resume on 'drain'. Bounds per-connection memory on slow
+          // clients without reintroducing full-reply buffering.
+          let upstreamPaused = false;
+          const sseWrite = (chunk) => {
+            const ok = res.write(chunk);
+            if (ok === false && !upstreamPaused) { upstreamPaused = true; upRes.pause(); }
+            return ok;
+          };
+          res.on('drain', () => {
+            if (upstreamPaused) { upstreamPaused = false; upRes.resume(); }
+          });
+          const finishStream = () => {
             usageWatcher.flush();
             logUsageAcc = usageWatcher.get();
-            const body = Buffer.isBuffer(outParts[0]) || outParts.length === 0
-              ? Buffer.concat(outParts.map(p => (Buffer.isBuffer(p) ? p : Buffer.from(p))))
-              : Buffer.from(outParts.join(''));
-            // Capture the upstream error type on the access log line so a 0-token
-            // /v1/messages entry is self-explanatory (rate_limit_error carries no
-            // usage field — that's not a logging bug, it's Anthropic's error shape).
-            if (upRes.statusCode >= 400) {
-              logErrorType = extractAnthropicErrorType(body.toString()) || `upstream_${upRes.statusCode}`;
-            }
-            const sseHeaders = { ...upRes.headers };
-            delete sseHeaders['transfer-encoding'];
-            sseHeaders['content-length'] = String(body.length);
-            res.writeHead(upRes.statusCode, sseHeaders);
-            res.end(body);
+            try { res.end(); } catch (_) {}
           };
           if (BILLING_MODE) {
             // Guard against createSSETransformer returning a bad value (a botched
@@ -1392,19 +1435,20 @@ const handler = (req, res) => {
               console.error('[PROXY] createSSETransformer returned invalid transformer; passing SSE through unmapped');
               xform = null;
             }
+            const rawDecoder = xform ? null : new StringDecoder('utf8');
             upRes.on('data', chunk => {
               usageWatcher.feed(chunk);
-              const out = xform ? xform.onData(chunk) : chunk.toString();
-              if (out) outParts.push(out);
+              const out = xform ? xform.onData(chunk) : rawDecoder.write(chunk);
+              if (out) sseWrite(out);
             });
             upRes.on('end', () => {
-              const tail = xform ? xform.onEnd() : '';
-              if (tail) outParts.push(tail);
-              flushBuffered();
+              const tail = xform ? xform.onEnd() : rawDecoder.end();
+              if (tail) sseWrite(tail);
+              finishStream();
             });
           } else {
-            upRes.on('data', chunk => { usageWatcher.feed(chunk); outParts.push(chunk); });
-            upRes.on('end', () => { flushBuffered(); });
+            upRes.on('data', chunk => { usageWatcher.feed(chunk); sseWrite(chunk); });
+            upRes.on('end', () => { finishStream(); });
           }
           upRes.on('error', e => {
             console.error(`[PROXY] /v1/messages SSE upstream error: ${e.message}`);
