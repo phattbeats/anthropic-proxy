@@ -71,6 +71,51 @@ function attachUpstreamTimeout(req, label) {
     req.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`));
   });
 }
+// Per-stream idle timeout for the downstream SSE response. The upstream side
+// has attachUpstreamTimeout; this is the sibling. If no chunk reaches the
+// client for SSE_IDLE_TIMEOUT_MS, end the stream with an OpenAI-style error
+// chunk + a single log line. Reuses the same wrap-originals pattern as the
+// upstream attach*Timeout so the timeout handler can write the error chunk
+// without re-arming the timer (PHA-1844 audit, H3).
+const SSE_IDLE_TIMEOUT_MS = parseInt(process.env.SSE_IDLE_TIMEOUT_MS || '60000');
+function attachStreamIdleTimeout(res, label) {
+  if (!res || res.__sseIdleAttached) return;
+  res.__sseIdleAttached = true;
+  let timer = null;
+  const arm = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      console.error(`[PROXY] SSE stream idle for ${SSE_IDLE_TIMEOUT_MS}ms (${label}); ending with stream error chunk`);
+      try {
+        const errChunk = `data: ${JSON.stringify({
+          id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000), model: 'unknown',
+          choices: [{ index: 0, delta: {}, finish_reason: 'error' }],
+          error: { message: `stream idle timeout after ${SSE_IDLE_TIMEOUT_MS}ms`, type: 'idle_timeout', code: 'idle_timeout', param: null },
+        })}\n\n`;
+        // Use the saved originals so the wrapped write/end isn't re-armed by
+        // this final write. The subsequent end() also clears the timer.
+        try { res.__origWrite(errChunk); } catch (_) {}
+        try { res.__origEnd(); } catch (_) {}
+      } catch (_) {}
+    }, SSE_IDLE_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+  };
+  const origWrite = res.write.bind(res);
+  const origEnd = res.end.bind(res);
+  res.__origWrite = origWrite;
+  res.__origEnd = origEnd;
+  res.write = function(chunk, encoding, cb) {
+    arm();
+    return origWrite(chunk, encoding, cb);
+  };
+  res.end = function(chunk, encoding, cb) {
+    if (timer) { clearTimeout(timer); timer = null; }
+    return origEnd(chunk, encoding, cb);
+  };
+  res.on('close', () => { if (timer) { clearTimeout(timer); timer = null; } });
+  arm();
+}
 const OAUTH_PREFIX = 'sk-ant-oat';
 const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -742,6 +787,7 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
       });
+      attachStreamIdleTimeout(res, `${method} ${targetPath}`);
       // Guard against upstream connection drops mid-stream — without this the
       // proxyRes 'error' event is uncaught and crashes the process.
       proxyRes.on('error', e => {
@@ -749,6 +795,9 @@ function forwardToAnthropic(targetPath, method, headers, body, res, stream) {
         if (!res.headersSent) { res.writeHead(502); res.end(JSON.stringify({ error: e.message })); }
         else if (res.writable) res.end();
       });
+      // Node's pipe() handles backpressure correctly (pauses source when the
+      // sink's write() returns false, resumes on 'drain') so we don't need to
+      // wire pause/resume by hand here — only the idle timeout.
       proxyRes.pipe(res);
     } else {
       let chunks = [];
@@ -978,6 +1027,24 @@ const handler = (req, res) => {
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
           });
+          attachStreamIdleTimeout(res, 'POST /v1/messages (chat/completions) SSE');
+          // H3 (PHA-1844): honor backpressure. Every res.write() below is routed
+          // through `sseWrite`; when the kernel buffer is saturated it returns
+          // false and we pause proxyRes until the downstream emits 'drain'.
+          // Without this, a slow client caused unbounded proxy-side buffering
+          // (and memory growth) per connection.
+          let upstreamPaused = false;
+          const sseWrite = (chunk) => {
+            const ok = res.write(chunk);
+            if (ok === false && !upstreamPaused) {
+              upstreamPaused = true;
+              proxyRes.pause();
+            }
+            return ok;
+          };
+          res.on('drain', () => {
+            if (upstreamPaused) { upstreamPaused = false; proxyRes.resume(); }
+          });
           let buffer = '';
           let usage = { ...EMPTY_USAGE };
           let chatId = 'chatcmpl-proxy';
@@ -996,7 +1063,7 @@ const handler = (req, res) => {
             for (const line of lines) {
               if (line.startsWith('data: ')) {
                 const data = line.slice(6).trim();
-                if (data === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
+                if (data === '[DONE]') { sseWrite('data: [DONE]\n\n'); continue; }
                 try {
                   const ev = JSON.parse(data);
                   if (ev.type === 'error') {
@@ -1004,8 +1071,8 @@ const handler = (req, res) => {
                     // incident). Dropping it makes the reply look like a silent
                     // cutoff; surface it as an OpenAI-style stream error chunk.
                     console.error(`[PROXY] chat/completions mid-stream error: ${data}`);
-                    res.write(`data: ${anthropicErrorToOpenAI(ev)}\n\n`);
-                    res.write('data: [DONE]\n\n');
+                    sseWrite(`data: ${anthropicErrorToOpenAI(ev)}\n\n`);
+                    sseWrite('data: [DONE]\n\n');
                     continue;
                   }
                   if (ev.type === 'message_start') {
@@ -1014,7 +1081,7 @@ const handler = (req, res) => {
                     if (!sentRole) {
                       sentRole = true;
                       // OpenAI emits an initial chunk carrying only the role delta before any content.
-                      res.write(`data: ${JSON.stringify({
+                      sseWrite(`data: ${JSON.stringify({
                         id: chatId, object: 'chat.completion.chunk',
                         created: Math.floor(Date.now()/1000), model,
                         choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
@@ -1025,13 +1092,13 @@ const handler = (req, res) => {
                   if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
                     const idx = nextToolCallIndex++;
                     toolCallIndexByBlock[ev.index] = idx;
-                    res.write(`data: ${JSON.stringify({
+                    sseWrite(`data: ${JSON.stringify({
                       id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: ev.content_block.id, type: 'function', function: { name: ev.content_block.name, arguments: '' } }] }, finish_reason: null }],
                     })}\n\n`);
                   } else if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
-                    res.write(`data: ${JSON.stringify({
+                    sseWrite(`data: ${JSON.stringify({
                       id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: { content: ev.delta.text }, finish_reason: null }],
@@ -1039,14 +1106,14 @@ const handler = (req, res) => {
                   } else if (ev.type === 'content_block_delta' && ev.delta?.type === 'input_json_delta') {
                     const idx = toolCallIndexByBlock[ev.index];
                     if (idx !== undefined) {
-                      res.write(`data: ${JSON.stringify({
+                      sseWrite(`data: ${JSON.stringify({
                         id: 'chatcmpl-proxy', object: 'chat.completion.chunk',
                         created: Math.floor(Date.now()/1000), model,
                         choices: [{ index: 0, delta: { tool_calls: [{ index: idx, function: { arguments: ev.delta.partial_json || '' } }] }, finish_reason: null }],
                       })}\n\n`);
                     }
                   } else if (ev.type === 'message_delta' && ev.delta?.stop_reason) {
-                    res.write(`data: ${JSON.stringify({
+                    sseWrite(`data: ${JSON.stringify({
                       id: chatId, object: 'chat.completion.chunk',
                       created: Math.floor(Date.now()/1000), model,
                       choices: [{ index: 0, delta: {}, finish_reason: mapStopReason(ev.delta.stop_reason) }],
@@ -1054,18 +1121,18 @@ const handler = (req, res) => {
                     // OpenAI's stream_options.include_usage sends one extra chunk with
                     // an empty choices array carrying final token usage before [DONE].
                     if (includeUsage) {
-                      res.write(`data: ${JSON.stringify({
+                      sseWrite(`data: ${JSON.stringify({
                         id: chatId, object: 'chat.completion.chunk',
                         created: Math.floor(Date.now()/1000), model,
                         choices: [],
                         usage: openAIUsage(usage),
                       })}\n\n`);
                     }
-                    res.write('data: [DONE]\n\n');
+                    sseWrite('data: [DONE]\n\n');
                   }
                 } catch(e) {}
               } else if (line.trim()) {
-                res.write(line + '\n');
+                sseWrite(line + '\n');
               }
             }
           };
@@ -1189,7 +1256,21 @@ const handler = (req, res) => {
           delete sseHeaders['content-length'];
           delete sseHeaders['transfer-encoding'];
           res.writeHead(upRes.statusCode, sseHeaders);
-          const usageWatcher = makeSSEUsageWatcher(model);
+          attachStreamIdleTimeout(res, 'POST /v1/messages SSE passthrough');
+          // H3 (PHA-1844): honor backpressure. sseWrite returns false when the
+          // downstream kernel buffer is saturated; on false we pause upRes and
+          // resume on 'drain'. This bounds per-connection memory under slow
+          // clients, same shape as the chat/completions path.
+          let upstreamPaused = false;
+          const sseWrite = (chunk) => {
+            const ok = res.write(chunk);
+            if (ok === false && !upstreamPaused) { upstreamPaused = true; upRes.pause(); }
+            return ok;
+          };
+          res.on('drain', () => {
+            if (upstreamPaused) { upstreamPaused = false; upRes.resume(); }
+          });
+                    const usageWatcher = makeSSEUsageWatcher(model);
           if (BILLING_MODE) {
             // Guard against createSSETransformer returning a bad value (a botched
             // build once shipped a body-less wrapper that returned undefined and
@@ -1203,17 +1284,17 @@ const handler = (req, res) => {
             upRes.on('data', chunk => {
               usageWatcher.feed(chunk);
               const out = xform ? xform.onData(chunk) : chunk.toString();
-              if (out) res.write(out);
+              if (out) sseWrite(out);
             });
             upRes.on('end', () => {
               const tail = xform ? xform.onEnd() : '';
-              if (tail) res.write(tail);
+              if (tail) sseWrite(tail);
               usageWatcher.flush();
               logUsageAcc = usageWatcher.get();
               res.end();
             });
           } else {
-            upRes.on('data', chunk => { usageWatcher.feed(chunk); res.write(chunk); });
+            upRes.on('data', chunk => { usageWatcher.feed(chunk); sseWrite(chunk); });
             upRes.on('end', () => {
               usageWatcher.flush();
               logUsageAcc = usageWatcher.get();
@@ -1358,4 +1439,4 @@ server.listen(PORT, '0.0.0.0', () => {
 // Test seam only. When the proxy is started normally (`node anthropic-proxy.js`)
 // require.main === module, so this is a no-op and nothing above it changes.
 // scripts/pha1596-usage-unit.js requires the file to unit-test the pure helpers.
-if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, capCacheControl };
+if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS };
