@@ -968,6 +968,39 @@ const handler = (req, res) => {
       return res.end(JSON.stringify(health));
     }
 
+    // Readiness endpoint — actively probes upstream Anthropic so an orchestrator
+    // can keep a half-broken pod out of the LB rotation. Returns 503 when the
+    // upstream is unreachable, with the failure reason in the body. Bounded by
+    // READINESS_TIMEOUT_MS (default 3s) so this never blocks longer than the
+    // healthcheck period (PHA-1844 audit, L2).
+    if (req.url === '/ready' || req.url === '/v1/ready') {
+      const readyTimeoutMs = parseInt(process.env.READINESS_TIMEOUT_MS || '3000', 10);
+      const startedAt = Date.now();
+      let settled = false;
+      const finish = (status, payload) => {
+        if (settled) return; settled = true;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+      const timer = setTimeout(() => finish(503, {
+        ready: false, reason: 'upstream-probe-timeout',
+        elapsedMs: Date.now() - startedAt, timeoutMs: readyTimeoutMs,
+      }), readyTimeoutMs);
+      timer.unref && timer.unref();
+      const readyReq = https.request({
+        hostname: TARGET, port: 443, path: '/v1/models', method: 'GET',
+        headers: { 'anthropic-version': '2023-06-01', accept: 'application/json' },
+      }, r => {
+        // Any 2xx/3xx/4xx response means the upstream is reachable; only a
+        // network failure (handled below) or our timeout counts as not-ready.
+        r.resume();
+        finish(200, { ready: true, upstreamStatus: r.statusCode, elapsedMs: Date.now() - startedAt });
+      });
+      readyReq.on('error', e => finish(503, { ready: false, reason: e.message, elapsedMs: Date.now() - startedAt }));
+      readyReq.end();
+      return;
+    }
+
     const apiKey = getApiKey(req.headers);
     const clientHasOAuth = apiKey.startsWith(OAUTH_PREFIX);
     const isOAuth = clientHasOAuth || BILLING_MODE;
