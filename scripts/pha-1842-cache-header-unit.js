@@ -40,7 +40,14 @@ function ok(label) { pass++; console.log(`  [OK] ${label}`); }
 const reqBody = JSON.stringify({
   model: 'claude-opus-4-1',
   system: [{ type: 'text', text: 'You are a helpful assistant.', cache_control: { type: 'ephemeral' } }],
-  messages: [{ role: 'user', content: 'hello there' }],
+  // Two breakpoints on purpose: Claude Code marks the system preamble AND the
+  // conversation history, and the messages one sits after the entire system array.
+  // Anything injected into `system` is inside that second prefix no matter where.
+  messages: [
+    { role: 'user', content: 'hello there' },
+    { role: 'assistant', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] },
+    { role: 'user', content: 'and again' },
+  ],
 });
 
 // --- 1. processBody() body output is byte-stable across a changed cc_prev_req chain
@@ -108,8 +115,14 @@ const reqBody = JSON.stringify({
       // identical between the two calls even though cc_prev_req changed.
       prefixStable: first.slice(0, first.indexOf('"cache_control"'))
         === second.slice(0, second.indexOf('"cache_control"')),
-      // The rotating block must sit AFTER the breakpoint, not before it.
+      // The block must sit AFTER the system breakpoint, not before it.
       blockAfterBreakpoint: first.indexOf('x-anthropic-billing-header') > first.indexOf('"cache_control"'),
+      // ...and, because message-level breakpoints all sit after the whole system
+      // array, the block must additionally be byte-constant: the prefix up to the
+      // LAST breakpoint has to be stable too, which appending alone cannot buy.
+      lastBreakpointStable: first.slice(0, first.lastIndexOf('"cache_control"'))
+        === second.slice(0, second.lastIndexOf('"cache_control"')),
+      blockHasNoRotatingField: !first.includes('cc_prev_req') && !second.includes('cc_prev_req'),
       systemValid: (() => { try { return Array.isArray(JSON.parse(first).system); } catch (e) { return false; } })(),
     };
     B.noteUpstreamStatus(529);
@@ -139,6 +152,12 @@ const reqBody = JSON.stringify({
   assert.strictEqual(dflt.prefixStable, true,
     'cached prefix must be byte-identical across requests despite a changed cc_prev_req');
   ok('body mode keeps the cache prefix byte-stable — fingerprint and prompt cache both work');
+
+  assert.strictEqual(dflt.blockHasNoRotatingField, true,
+    'the body block must not carry cc_prev_req — it rotates every request');
+  assert.strictEqual(dflt.lastBreakpointStable, true,
+    'prefix up to the LAST (message-level) breakpoint must also be byte-identical');
+  ok('body block is byte-constant, so message-level cache breakpoints survive too');
 
   const off = run('off');
   assert.strictEqual(off.header, null, 'off must not emit the reserved header');
