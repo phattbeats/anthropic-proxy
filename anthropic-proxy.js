@@ -1127,7 +1127,9 @@ const handler = (req, res) => {
       // request — it now goes out as a real header, leaving the body byte-stable).
       if (BILLING_MODE) {
         bodyStr = billing.processBody(bodyStr, billingSessionId);
-        headers['x-anthropic-billing-header'] = billing.buildBillingHeaderValue(bodyStr, billingSessionId);
+        // null unless BILLING_HEADER_MODE=header — see PHA-1887 in billing-mode.js.
+        const bh = billing.buildBillingHeaderValue(bodyStr, billingSessionId);
+        if (bh) headers['x-anthropic-billing-header'] = bh;
       }
       const bodyBuf = Buffer.from(bodyStr);
       headers['content-length'] = String(bodyBuf.length);
@@ -1371,7 +1373,9 @@ const handler = (req, res) => {
         // billing header from the processed body (PHA-1842: as a real header, not
         // body block, so system/message cache_control prefixes stay byte-stable).
         const billingProcessedStr = billing.processBody(sourceBodyStr, billingSessionId);
-        headers['x-anthropic-billing-header'] = billing.buildBillingHeaderValue(billingProcessedStr, billingSessionId);
+        // null unless BILLING_HEADER_MODE=header — see PHA-1887 in billing-mode.js.
+        const bh = billing.buildBillingHeaderValue(billingProcessedStr, billingSessionId);
+        if (bh) headers['x-anthropic-billing-header'] = bh;
         bodyBuf = Buffer.from(billingProcessedStr);
       } else if (parsed) {
         // Regular mode: inject Claude Code system prompt for OAuth + cap cache_control

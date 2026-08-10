@@ -26,6 +26,11 @@ const assert = require('assert');
 process.env.PROXY_MODE = 'billing';
 process.env.OAUTH_TOKEN = process.env.OAUTH_TOKEN || 'sk-ant-oat-test-token';
 process.env.CC_VERSION = process.env.CC_VERSION || '2.1.205';
+// PHA-1887 made the real header opt-in (it drew an immediate 529 from Anthropic's
+// edge — `x-anthropic-*` is their reserved request-header namespace). The PHA-1842
+// behaviour this file covers is now BILLING_HEADER_MODE=header, so opt in here.
+// The default-off guarantee is asserted separately in the child process below.
+process.env.BILLING_HEADER_MODE = 'header';
 
 const BILLING = require(path.join(__dirname, '..', 'billing-mode.js'));
 
@@ -78,6 +83,37 @@ const reqBody = JSON.stringify({
   const roundTripped = BILLING.reverseMap(genuine);
   assert.strictEqual(roundTripped, genuine, `genuine text corrupted by reverse-map: ${roundTripped}`);
   ok('reverseMap() no longer corrupts genuine text containing "external"/"usage quota"');
+}
+
+// --- 5. PHA-1887: the reserved-namespace header is OFF by default, and
+// BILLING_HEADER_MODE=body puts the fingerprint back in system[0] instead.
+// Run in child processes because BILLING_HEADER_MODE is read at module load.
+{
+  const { execFileSync } = require('child_process');
+  const modPath = path.join(__dirname, '..', 'billing-mode.js');
+  const probe = `
+    const B = require(${JSON.stringify(modPath)});
+    const body = ${JSON.stringify(reqBody)};
+    console.log(JSON.stringify({
+      header: B.buildBillingHeaderValue(body, 's'),
+      bodyHasBlock: B.processBody(body, 's').includes('x-anthropic-billing-header'),
+    }));
+  `;
+  const run = (mode) => {
+    const env = { ...process.env, PROXY_MODE: 'billing', CC_VERSION: '2.1.205' };
+    if (mode === null) delete env.BILLING_HEADER_MODE; else env.BILLING_HEADER_MODE = mode;
+    return JSON.parse(execFileSync(process.execPath, ['-e', probe], { env, encoding: 'utf8' }));
+  };
+
+  const dflt = run(null);
+  assert.strictEqual(dflt.header, null, 'default must not emit the x-anthropic-billing-header value');
+  assert.strictEqual(dflt.bodyHasBlock, false, 'default must not inject the body block either');
+  ok('default (no BILLING_HEADER_MODE) emits neither the reserved header nor a body block');
+
+  const bodyMode = run('body');
+  assert.strictEqual(bodyMode.header, null, 'body mode must not emit the reserved header');
+  assert.strictEqual(bodyMode.bodyHasBlock, true, 'body mode must restore the system[0] block');
+  ok('BILLING_HEADER_MODE=body restores the pre-1.4.12 system[0] fingerprint block');
 }
 
 console.log(`\npha-1842 cache-header unit: ${pass} passed, 0 failed`);
