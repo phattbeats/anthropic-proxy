@@ -85,35 +85,73 @@ const reqBody = JSON.stringify({
   ok('reverseMap() no longer corrupts genuine text containing "external"/"usage quota"');
 }
 
-// --- 5. PHA-1887: the reserved-namespace header is OFF by default, and
-// BILLING_HEADER_MODE=body puts the fingerprint back in system[0] instead.
-// Run in child processes because BILLING_HEADER_MODE is read at module load.
+// --- 5. PHA-1887: both carriers work. `body` (the default) appends the
+// fingerprint as the LAST system block, so it ships without moving any byte
+// ahead of the client's cache_control breakpoint; `header` sends the reserved
+// header but latches back to the body block on the first upstream 529 instead
+// of failing every request. Run in child processes because BILLING_HEADER_MODE
+// is read at module load.
 {
   const { execFileSync } = require('child_process');
   const modPath = path.join(__dirname, '..', 'billing-mode.js');
   const probe = `
     const B = require(${JSON.stringify(modPath)});
     const body = ${JSON.stringify(reqBody)};
-    console.log(JSON.stringify({
+    const first = B.processBody(body, 's');
+    B.setLastRequestId('req-id-999', 's');
+    const second = B.processBody(body, 's');
+    const out = {
+      mode: B.billingHeaderMode,
+      header: B.buildBillingHeaderValue(body, 's'),
+      bodyHasBlock: first.includes('x-anthropic-billing-header'),
+      // Everything up to (and including) the client's cached block must be
+      // identical between the two calls even though cc_prev_req changed.
+      prefixStable: first.slice(0, first.indexOf('"cache_control"'))
+        === second.slice(0, second.indexOf('"cache_control"')),
+      // The rotating block must sit AFTER the breakpoint, not before it.
+      blockAfterBreakpoint: first.indexOf('x-anthropic-billing-header') > first.indexOf('"cache_control"'),
+      systemValid: (() => { try { return Array.isArray(JSON.parse(first).system); } catch (e) { return false; } })(),
+    };
+    B.noteUpstreamStatus(529);
+    out.afterShed = {
+      mode: B.billingHeaderMode,
       header: B.buildBillingHeaderValue(body, 's'),
       bodyHasBlock: B.processBody(body, 's').includes('x-anthropic-billing-header'),
-    }));
+    };
+    console.log(JSON.stringify(out));
   `;
   const run = (mode) => {
     const env = { ...process.env, PROXY_MODE: 'billing', CC_VERSION: '2.1.205' };
     if (mode === null) delete env.BILLING_HEADER_MODE; else env.BILLING_HEADER_MODE = mode;
-    return JSON.parse(execFileSync(process.execPath, ['-e', probe], { env, encoding: 'utf8' }));
+    const raw = execFileSync(process.execPath, ['-e', probe], { env, encoding: 'utf8' });
+    return JSON.parse(raw.trim().split('\n').pop());
   };
 
   const dflt = run(null);
-  assert.strictEqual(dflt.header, null, 'default must not emit the x-anthropic-billing-header value');
-  assert.strictEqual(dflt.bodyHasBlock, false, 'default must not inject the body block either');
-  ok('default (no BILLING_HEADER_MODE) emits neither the reserved header nor a body block');
+  assert.strictEqual(dflt.mode, 'body', 'default mode must be body');
+  assert.strictEqual(dflt.header, null, 'default must not emit the reserved header');
+  assert.strictEqual(dflt.bodyHasBlock, true, 'default must ship the fingerprint in the body');
+  assert.strictEqual(dflt.systemValid, true, 'appended block must leave system a valid JSON array');
+  ok('default (BILLING_HEADER_MODE unset) ships the fingerprint as a body block, no reserved header');
 
-  const bodyMode = run('body');
-  assert.strictEqual(bodyMode.header, null, 'body mode must not emit the reserved header');
-  assert.strictEqual(bodyMode.bodyHasBlock, true, 'body mode must restore the system[0] block');
-  ok('BILLING_HEADER_MODE=body restores the pre-1.4.12 system[0] fingerprint block');
+  assert.strictEqual(dflt.blockAfterBreakpoint, true,
+    'fingerprint must be appended after the cache_control breakpoint, not prepended');
+  assert.strictEqual(dflt.prefixStable, true,
+    'cached prefix must be byte-identical across requests despite a changed cc_prev_req');
+  ok('body mode keeps the cache prefix byte-stable — fingerprint and prompt cache both work');
+
+  const off = run('off');
+  assert.strictEqual(off.header, null, 'off must not emit the reserved header');
+  assert.strictEqual(off.bodyHasBlock, false, 'off must not inject the body block');
+  ok('BILLING_HEADER_MODE=off still sends neither carrier');
+
+  const hdr = run('header');
+  assert.ok(hdr.header && hdr.header.startsWith('cc_version='), 'header mode must emit the header');
+  assert.strictEqual(hdr.bodyHasBlock, false, 'header mode must not double-ship in the body');
+  assert.strictEqual(hdr.afterShed.header, null, 'a 529 must latch the reserved header off');
+  assert.strictEqual(hdr.afterShed.bodyHasBlock, true, 'after the latch the fingerprint must fall back to the body');
+  assert.strictEqual(hdr.afterShed.mode, 'header(shed→body)', '/health must surface the latched state');
+  ok('BILLING_HEADER_MODE=header degrades to the body block on the first 529 instead of failing');
 }
 
 console.log(`\npha-1842 cache-header unit: ${pass} passed, 0 failed`);

@@ -1033,6 +1033,7 @@ const handler = (req, res) => {
       if (BILLING_MODE) {
         health.ccVersionEmulated = billing.CC_VERSION;
         health.accountUuidConfigured = billing.accountUuidConfigured;
+        health.billingHeaderMode = billing.billingHeaderMode;
         health.tokenSource = billingOAuthFallback ? 'stored+client' : 'client-only';
         if (billingOAuthFallback) {
           const expiresIn = (billingOAuthFallback.expiresAt - Date.now()) / 3600000;
@@ -1127,7 +1128,8 @@ const handler = (req, res) => {
       // request — it now goes out as a real header, leaving the body byte-stable).
       if (BILLING_MODE) {
         bodyStr = billing.processBody(bodyStr, billingSessionId);
-        // null unless BILLING_HEADER_MODE=header — see PHA-1887 in billing-mode.js.
+        // null unless BILLING_HEADER_MODE=header and the edge has not shed it — when it
+        // is null the fingerprint has already ridden along in the body (PHA-1887).
         const bh = billing.buildBillingHeaderValue(bodyStr, billingSessionId);
         if (bh) headers['x-anthropic-billing-header'] = bh;
       }
@@ -1147,6 +1149,7 @@ const handler = (req, res) => {
       const proxyReq = https.request(options, proxyRes => {
         // Track upstream request-id to chain the next request's cc_prev_req header.
         if (BILLING_MODE) billing.setLastRequestId(proxyRes.headers['request-id'] || proxyRes.headers['anthropic-request-id'], billingSessionId);
+        if (BILLING_MODE) billing.noteUpstreamStatus(proxyRes.statusCode);
         logQuota = extractQuota(proxyRes.headers);
         // Upstream rejected the request (overloaded/rate-limit/auth) — the body
         // is a JSON error, not SSE, even when the client asked for streaming.
@@ -1373,7 +1376,8 @@ const handler = (req, res) => {
         // billing header from the processed body (PHA-1842: as a real header, not
         // body block, so system/message cache_control prefixes stay byte-stable).
         const billingProcessedStr = billing.processBody(sourceBodyStr, billingSessionId);
-        // null unless BILLING_HEADER_MODE=header — see PHA-1887 in billing-mode.js.
+        // null unless BILLING_HEADER_MODE=header and the edge has not shed it — when it
+        // is null the fingerprint has already ridden along in the body (PHA-1887).
         const bh = billing.buildBillingHeaderValue(billingProcessedStr, billingSessionId);
         if (bh) headers['x-anthropic-billing-header'] = bh;
         bodyBuf = Buffer.from(billingProcessedStr);
@@ -1404,6 +1408,7 @@ const handler = (req, res) => {
         method: 'POST', headers,
       }, upRes => {
         if (BILLING_MODE) billing.setLastRequestId(upRes.headers['request-id'] || upRes.headers['anthropic-request-id'], billingSessionId);
+        if (BILLING_MODE) billing.noteUpstreamStatus(upRes.statusCode);
         logQuota = extractQuota(upRes.headers);
         if (isStream) {
           // PHA-1860: REVERTS PHA-1850 (M5) on this path. M5 buffered the entire

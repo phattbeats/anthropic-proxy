@@ -213,18 +213,50 @@ function extractFirstUserText(bodyStr) {
 // matches genuine 2.1.205, which runs sdk-cli, and PR #61 verified sdk-cli returns
 // 200 with zero extra-usage. Realigning to genuine is what clears the block.
 //
-// PHA-1887: DEFAULT OFF. `x-anthropic-*` is Anthropic's own reserved request-header
-// namespace, evaluated at their edge before the request reaches the model. Emitting
-// an undefined name in that namespace is not the same class of action as putting the
-// same string in the body: 1.4.11 (body block) serves traffic, 1.4.12+ (real header)
-// took an immediate 529 on every request. The 1.4.12 rationale — keeping the system
-// array byte-stable for prompt-cache prefix matching — is still correct, but it is a
-// cache-efficiency win and this is an availability loss, so the header stays off
-// unless someone re-verifies it against live traffic and sets
-// BILLING_HEADER_MODE=header. `off` (default) sends neither header nor body block;
-// `body` restores the pre-1.4.12 system[0] injection.
-const BILLING_HEADER_MODE = (process.env.BILLING_HEADER_MODE || 'off').toLowerCase();
-const emitBillingHeader = () => BILLING_HEADER_MODE === 'header';
+// PHA-1887: the fundamental issue across this whole series is that each change
+// picked ONE of two properties and paid for it with the other:
+//
+//   <=1.4.11  fingerprint delivered (system[0] body block)  — prompt cache dead
+//   1.4.12+   prompt cache alive (real header)              — every request 529s
+//
+// Both properties are obtainable at once. The cache is a *prefix* cache (tools ->
+// system -> messages), so what breaks it is not the block existing, it is the block
+// sitting AHEAD of the client's cache_control breakpoints. Injected as the LAST
+// system element instead of the first, the rotating value lands after every
+// breakpoint: the cached prefix stays byte-identical request to request and the
+// fingerprint still ships. That is `body` mode, and it is now the default.
+//
+// `header` mode (1.4.12 behaviour) stays available, but no longer takes the whole
+// proxy down when Anthropic's edge sheds it: `x-anthropic-*` is their own reserved
+// request-header namespace, evaluated before the request reaches a model, and an
+// undefined name in it is shed as 529 Overloaded rather than rejected as 400. The
+// first such 529 latches the header off for the rest of the process and the
+// fingerprint falls back to the body block — so header mode degrades to a working
+// configuration instead of an outage, and self-heals on restart if Anthropic ever
+// starts accepting it.
+//
+//   off     neither header nor body block
+//   body    (default) fingerprint appended as the last system block, cache-stable
+//   header  real header, auto-falling back to `body` on the first 529
+const BILLING_HEADER_MODE = (process.env.BILLING_HEADER_MODE || 'body').toLowerCase();
+// Flipped by noteUpstreamStatus() when the edge sheds a header-mode request.
+let billingHeaderShed = false;
+const emitBillingHeader = () => BILLING_HEADER_MODE === 'header' && !billingHeaderShed;
+// True when the fingerprint has to ride in the body: either that was asked for, or
+// header mode was asked for and the edge refused it.
+const injectBillingBlock = () => BILLING_HEADER_MODE === 'body'
+  || (BILLING_HEADER_MODE === 'header' && billingHeaderShed);
+
+// Called once per upstream response (both /v1/messages and the chat/completions
+// bridge). A 529 while we were sending the reserved header is the exact 1.4.12
+// failure; latch it off so the next request uses the body block and serves.
+function noteUpstreamStatus(statusCode) {
+  if (statusCode === 529 && emitBillingHeader()) {
+    billingHeaderShed = true;
+    console.error('[PROXY] upstream 529 with x-anthropic-billing-header set — disabling the header '
+      + 'for this process and falling back to the in-body fingerprint (PHA-1887).');
+  }
+}
 
 function buildBillingHeaderValue(bodyStr, sessionId) {
   if (!emitBillingHeader()) return null;
@@ -392,12 +424,14 @@ function processBody(bodyStr, sessionId) {
     }
   }
 
-  // Layer 1 (BILLING_HEADER_MODE=body only): billing fingerprint block injected as
-  // system[0], the pre-1.4.12 behaviour. Costs prompt-cache prefix stability (the
-  // value rotates), which is exactly why PHA-1842 moved it to a header — kept here
-  // as the fallback for anyone who needs the fingerprint back without the
-  // reserved-namespace header that PHA-1887 traced the 529s to.
-  if (BILLING_HEADER_MODE === 'body') {
+  // Layer 1: billing fingerprint as a system block. Appended as the LAST system
+  // element, not system[0] — the pre-1.4.12 code prepended it, which put a value
+  // that rotates every request ahead of every cache_control breakpoint and killed
+  // the prompt-cache prefix on each call. At the tail it sits after all of them, so
+  // the cached prefix is byte-identical between requests and the fingerprint still
+  // ships (PHA-1887). Active in `body` mode, and in `header` mode once the edge has
+  // shed the reserved header.
+  if (injectBillingBlock()) {
     const fingerprint = computeBillingFingerprint(extractFirstUserText(m));
     const prevId = getLastRequestId(sessionId);
     const prev = prevId ? ` cc_prev_req=${prevId};` : '';
@@ -406,9 +440,14 @@ function processBody(bodyStr, sessionId) {
       text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;${prev}`,
     });
     const sysArrayIdx = m.indexOf('"system":[');
-    if (sysArrayIdx !== -1) {
-      const insertAt = sysArrayIdx + '"system":['.length;
-      m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
+    const sysArrayEnd = sysArrayIdx !== -1
+      ? findMatchingBracket(m, sysArrayIdx + '"system":'.length)
+      : -1;
+    if (sysArrayIdx !== -1 && sysArrayEnd !== -1) {
+      // Append after the last element (`]` is at sysArrayEnd). An empty array takes
+      // the block alone, with no leading comma.
+      const isEmpty = m.slice(sysArrayIdx + '"system":['.length, sysArrayEnd).trim() === '';
+      m = m.slice(0, sysArrayEnd) + (isEmpty ? '' : ',') + BILLING_BLOCK + m.slice(sysArrayEnd);
     } else if (m.includes('"system":"')) {
       const sysStart = m.indexOf('"system":"');
       let i = sysStart + '"system":"'.length;
@@ -420,7 +459,7 @@ function processBody(bodyStr, sessionId) {
       const sysEnd = i + 1;
       const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
       m = m.slice(0, sysStart)
-        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+        + '"system":[{"type":"text","text":' + originalSysStr + '},' + BILLING_BLOCK + ']'
         + m.slice(sysEnd);
     } else {
       m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
@@ -776,6 +815,12 @@ module.exports = {
   deriveSessionId,
   setCCVersion,
   setLastRequestId,
+  noteUpstreamStatus,
+  // Which of the two fingerprint carriers is live right now — surfaced on /health
+  // so a fallback latch (PHA-1887) is visible without reading logs.
+  get billingHeaderMode() {
+    return BILLING_HEADER_MODE === 'header' && billingHeaderShed ? 'header(shed→body)' : BILLING_HEADER_MODE;
+  },
   // Whether an account_uuid is configured — surfaced on /health so ops can confirm
   // the primary anti-detection field is actually set before/after a deploy.
   get accountUuidConfigured() { return !!ACCOUNT_UUID; },
