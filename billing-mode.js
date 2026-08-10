@@ -212,7 +212,22 @@ function extractFirstUserText(bodyStr) {
 // June-15 surcharge memo) matched genuine INTERACTIVE cli; the current detection
 // matches genuine 2.1.205, which runs sdk-cli, and PR #61 verified sdk-cli returns
 // 200 with zero extra-usage. Realigning to genuine is what clears the block.
+//
+// PHA-1887: DEFAULT OFF. `x-anthropic-*` is Anthropic's own reserved request-header
+// namespace, evaluated at their edge before the request reaches the model. Emitting
+// an undefined name in that namespace is not the same class of action as putting the
+// same string in the body: 1.4.11 (body block) serves traffic, 1.4.12+ (real header)
+// took an immediate 529 on every request. The 1.4.12 rationale — keeping the system
+// array byte-stable for prompt-cache prefix matching — is still correct, but it is a
+// cache-efficiency win and this is an availability loss, so the header stays off
+// unless someone re-verifies it against live traffic and sets
+// BILLING_HEADER_MODE=header. `off` (default) sends neither header nor body block;
+// `body` restores the pre-1.4.12 system[0] injection.
+const BILLING_HEADER_MODE = (process.env.BILLING_HEADER_MODE || 'off').toLowerCase();
+const emitBillingHeader = () => BILLING_HEADER_MODE === 'header';
+
 function buildBillingHeaderValue(bodyStr, sessionId) {
+  if (!emitBillingHeader()) return null;
   const firstText = extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const prevId = getLastRequestId(sessionId);
@@ -377,6 +392,41 @@ function processBody(bodyStr, sessionId) {
     }
   }
 
+  // Layer 1 (BILLING_HEADER_MODE=body only): billing fingerprint block injected as
+  // system[0], the pre-1.4.12 behaviour. Costs prompt-cache prefix stability (the
+  // value rotates), which is exactly why PHA-1842 moved it to a header — kept here
+  // as the fallback for anyone who needs the fingerprint back without the
+  // reserved-namespace header that PHA-1887 traced the 529s to.
+  if (BILLING_HEADER_MODE === 'body') {
+    const fingerprint = computeBillingFingerprint(extractFirstUserText(m));
+    const prevId = getLastRequestId(sessionId);
+    const prev = prevId ? ` cc_prev_req=${prevId};` : '';
+    const BILLING_BLOCK = JSON.stringify({
+      type: 'text',
+      text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;${prev}`,
+    });
+    const sysArrayIdx = m.indexOf('"system":[');
+    if (sysArrayIdx !== -1) {
+      const insertAt = sysArrayIdx + '"system":['.length;
+      m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
+    } else if (m.includes('"system":"')) {
+      const sysStart = m.indexOf('"system":"');
+      let i = sysStart + '"system":"'.length;
+      while (i < m.length) {
+        if (m[i] === '\\') { i += 2; continue; }
+        if (m[i] === '"') break;
+        i++;
+      }
+      const sysEnd = i + 1;
+      const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
+      m = m.slice(0, sysStart)
+        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+        + m.slice(sysEnd);
+    } else {
+      m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
+    }
+  }
+
   // Metadata injection
   // Genuine metadata.user_id is {device_id, account_uuid, session_id} in that order.
   // account_uuid absence is the primary detection tell (PHA-1389 / openclaw PR #61);
@@ -527,6 +577,13 @@ function buildBillingHeaders(oauthToken, existingHeaders, sessionId) {
     if (value !== undefined) headers[key] = value;
   }
   headers['authorization'] = `Bearer ${oauthToken}`;
+  // PHA-1887: the empty allowlist (PHA-1848) stopped the client's `accept` from
+  // riding along, and nothing replaced it — so 1.5.x sent NO accept header at all.
+  // The stainless SDK genuine CC runs always sends `application/json`; sending
+  // none is a fingerprint mismatch introduced by a fix that was only ever checked
+  // for what it removed, not for what it left missing. Set it explicitly, as a
+  // proxy-controlled value, which is what the allowlist rationale actually calls for.
+  headers['accept'] = 'application/json';
   headers['accept-encoding'] = 'identity';
   headers['anthropic-version'] = '2023-06-01';
   // sessionId, once resolved, only ever came from deriveSessionId()'s

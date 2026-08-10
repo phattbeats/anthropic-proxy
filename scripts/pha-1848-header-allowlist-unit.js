@@ -116,6 +116,12 @@ const PROXY_OAUTH_TOKEN = 'sk-ant-oat-PROXY-REAL-TOKEN';
   assert.strictEqual(headers['authorization'], `Bearer ${PROXY_OAUTH_TOKEN}`);
   assert.strictEqual(headers['anthropic-version'], '2023-06-01');
   assert.strictEqual(headers['accept-encoding'], 'identity');
+  // PHA-1887: emptying the allowlist stopped the client's `accept` from riding
+  // along and nothing replaced it, so 1.5.x sent none at all — a fingerprint
+  // mismatch against the stainless SDK genuine CC runs. It must be present as a
+  // proxy-controlled value, not merely absent-because-dropped.
+  assert.strictEqual(headers['accept'], 'application/json',
+    `accept must be set explicitly by the proxy, got: ${headers['accept']}`);
   assert.ok(headers['anthropic-beta'] && headers['anthropic-beta'].length > 0,
     'anthropic-beta must be populated');
   assert.ok(headers['user-agent'] && headers['user-agent'].includes('claude-cli'),
