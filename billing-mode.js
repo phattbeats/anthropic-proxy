@@ -431,13 +431,22 @@ function processBody(bodyStr, sessionId) {
   // the cached prefix is byte-identical between requests and the fingerprint still
   // ships (PHA-1887). Active in `body` mode, and in `header` mode once the edge has
   // shed the reserved header.
+  //
+  // Appending is necessary but NOT sufficient: `system` is only the first of the
+  // client's cache_control breakpoints. Claude Code also marks conversation history
+  // in `messages`, which is the larger cache by far, and every one of those
+  // breakpoints sits AFTER the whole system array — so a value that rotates per
+  // request still invalidates them all no matter where in `system` it lands. The
+  // only position-independent fix is for the block itself to be byte-constant, so
+  // the body carrier omits cc_prev_req (the one rotating field). The fingerprint is
+  // derived from the first user message and is therefore stable for the life of a
+  // conversation. cc_prev_req is still chained in `header` mode, where it rides
+  // outside the body and costs no cache at all.
   if (injectBillingBlock()) {
     const fingerprint = computeBillingFingerprint(extractFirstUserText(m));
-    const prevId = getLastRequestId(sessionId);
-    const prev = prevId ? ` cc_prev_req=${prevId};` : '';
     const BILLING_BLOCK = JSON.stringify({
       type: 'text',
-      text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;${prev}`,
+      text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;`,
     });
     const sysArrayIdx = m.indexOf('"system":[');
     const sysArrayEnd = sysArrayIdx !== -1
