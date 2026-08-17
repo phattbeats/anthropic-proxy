@@ -115,8 +115,10 @@ const reqBody = JSON.stringify({
       // identical between the two calls even though cc_prev_req changed.
       prefixStable: first.slice(0, first.indexOf('"cache_control"'))
         === second.slice(0, second.indexOf('"cache_control"')),
-      // The block must sit AFTER the system breakpoint, not before it.
-      blockAfterBreakpoint: first.indexOf('x-anthropic-billing-header') > first.indexOf('"cache_control"'),
+      // The block must sit BEFORE the system breakpoint (system[0] is the
+      // recognition position used by the first-message/tool-safety classifiers).
+      blockBeforeBreakpoint: first.indexOf('x-anthropic-billing-header') < first.indexOf('"cache_control"'),
+      blockAtSystemStart: (() => { try { return JSON.parse(first).system[0].text.startsWith('x-anthropic-billing-header'); } catch (_) { return false; } })(),
       // ...and, because message-level breakpoints all sit after the whole system
       // array, the block must additionally be byte-constant: the prefix up to the
       // LAST breakpoint has to be stable too, which appending alone cannot buy.
@@ -147,8 +149,10 @@ const reqBody = JSON.stringify({
   assert.strictEqual(dflt.systemValid, true, 'appended block must leave system a valid JSON array');
   ok('default (BILLING_HEADER_MODE unset) ships the fingerprint as a body block, no reserved header');
 
-  assert.strictEqual(dflt.blockAfterBreakpoint, true,
-    'fingerprint must be appended after the cache_control breakpoint, not prepended');
+  assert.strictEqual(dflt.blockBeforeBreakpoint, true,
+    'fingerprint must sit before the cache_control breakpoint (system[0])');
+  assert.strictEqual(dflt.blockAtSystemStart, true,
+    'fingerprint must be the first system block, not appended after user content');
   assert.strictEqual(dflt.prefixStable, true,
     'cached prefix must be byte-identical across requests despite a changed cc_prev_req');
   ok('body mode keeps the cache prefix byte-stable — fingerprint and prompt cache both work');
