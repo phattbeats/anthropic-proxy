@@ -424,24 +424,16 @@ function processBody(bodyStr, sessionId) {
     }
   }
 
-  // Layer 1: billing fingerprint as a system block. Appended as the LAST system
-  // element, not system[0] — the pre-1.4.12 code prepended it, which put a value
-  // that rotates every request ahead of every cache_control breakpoint and killed
-  // the prompt-cache prefix on each call. At the tail it sits after all of them, so
-  // the cached prefix is byte-identical between requests and the fingerprint still
-  // ships (PHA-1887). Active in `body` mode, and in `header` mode once the edge has
-  // shed the reserved header.
+  // Layer 1: billing fingerprint as a system block. It must remain at system[0]:
+  // that is the recognition position used by the first-message/tool-safety
+  // classifiers. The original pre-1.4.12 block was rotating and therefore broke
+  // every downstream cache prefix. PHA-1887 fixes that independently by making the
+  // block byte-constant (no `cc_prev_req`); its fingerprint is derived from the
+  // first user message and remains stable for the life of a conversation.
   //
-  // Appending is necessary but NOT sufficient: `system` is only the first of the
-  // client's cache_control breakpoints. Claude Code also marks conversation history
-  // in `messages`, which is the larger cache by far, and every one of those
-  // breakpoints sits AFTER the whole system array — so a value that rotates per
-  // request still invalidates them all no matter where in `system` it lands. The
-  // only position-independent fix is for the block itself to be byte-constant, so
-  // the body carrier omits cc_prev_req (the one rotating field). The fingerprint is
-  // derived from the first user message and is therefore stable for the life of a
-  // conversation. cc_prev_req is still chained in `header` mode, where it rides
-  // outside the body and costs no cache at all.
+  // `header` mode uses the reserved HTTP header and latches back to this body
+  // block after the first upstream 529. In the default body mode the header is not
+  // emitted, but the same system[0] recognition signal is always present.
   if (injectBillingBlock()) {
     const fingerprint = computeBillingFingerprint(extractFirstUserText(m));
     const BILLING_BLOCK = JSON.stringify({
@@ -449,14 +441,15 @@ function processBody(bodyStr, sessionId) {
       text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fingerprint}; cc_entrypoint=sdk-cli;`,
     });
     const sysArrayIdx = m.indexOf('"system":[');
-    const sysArrayEnd = sysArrayIdx !== -1
-      ? findMatchingBracket(m, sysArrayIdx + '"system":'.length)
-      : -1;
-    if (sysArrayIdx !== -1 && sysArrayEnd !== -1) {
-      // Append after the last element (`]` is at sysArrayEnd). An empty array takes
-      // the block alone, with no leading comma.
-      const isEmpty = m.slice(sysArrayIdx + '"system":['.length, sysArrayEnd).trim() === '';
-      m = m.slice(0, sysArrayEnd) + (isEmpty ? '' : ',') + BILLING_BLOCK + m.slice(sysArrayEnd);
+    if (sysArrayIdx !== -1) {
+      // System[0] is the only position that preserves the first-request recognition
+      // signal. The block is byte-constant, so placing it before cache_control
+      // no longer invalidates the prefix. An empty array takes the block alone,
+      // with no surrounding comma; a non-empty array prepends `block,` before the
+      // existing first element.
+      const sysArrayStart = sysArrayIdx + '"system":['.length;
+      const isEmpty = m.slice(sysArrayStart).trim().startsWith(']');
+      m = m.slice(0, sysArrayStart) + BILLING_BLOCK + (isEmpty ? '' : ',') + m.slice(sysArrayStart);
     } else if (m.includes('"system":"')) {
       const sysStart = m.indexOf('"system":"');
       let i = sysStart + '"system":"'.length;
@@ -468,7 +461,7 @@ function processBody(bodyStr, sessionId) {
       const sysEnd = i + 1;
       const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
       m = m.slice(0, sysStart)
-        + '"system":[{"type":"text","text":' + originalSysStr + '},' + BILLING_BLOCK + ']'
+        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
         + m.slice(sysEnd);
     } else {
       m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);

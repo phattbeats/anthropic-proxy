@@ -1124,8 +1124,11 @@ const handler = (req, res) => {
       }
       // In billing mode, run the body through the transformer, then derive the
       // billing header from the processed body (PHA-1842: this used to be injected
-      // as system[0] in the body, which broke prompt-cache prefix matching on every
-      // request — it now goes out as a real header, leaving the body byte-stable).
+      // as a system[0] body block in <=1.4.11, which broke prompt-cache prefix
+      // matching on every request. The aadcdcf fix made the system[0] block
+      // byte-constant, so it is inserted as the first system element — the
+      // recognition position used by the first-message/tool-safety classifiers
+      // — and the cache prefix still holds across requests.
       if (BILLING_MODE) {
         bodyStr = billing.processBody(bodyStr, billingSessionId);
         // null unless BILLING_HEADER_MODE=header and the edge has not shed it — when it
@@ -1373,8 +1376,9 @@ const handler = (req, res) => {
 
       if (BILLING_MODE) {
         // Billing mode: run full request transformation pipeline, then derive the
-        // billing header from the processed body (PHA-1842: as a real header, not
-        // body block, so system/message cache_control prefixes stay byte-stable).
+        // billing header from the processed body (PHA-1842/1887: the body block
+        // is byte-constant at system[0], so the prefix remains stable across
+        // requests and the first-message recognition signal is preserved).
         const billingProcessedStr = billing.processBody(sourceBodyStr, billingSessionId);
         // null unless BILLING_HEADER_MODE=header and the edge has not shed it — when it
         // is null the fingerprint has already ridden along in the body (PHA-1887).
