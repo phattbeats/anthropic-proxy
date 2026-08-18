@@ -1279,7 +1279,13 @@ const handler = (req, res) => {
                     })}\n\n`);
                     // OpenAI's stream_options.include_usage sends one extra chunk with
                     // an empty choices array carrying final token usage before [DONE].
-                    if (includeUsage) {
+                    // PHA-1887: LiteLLM, SillyTavern and several other clients do not
+                    // set stream_options.include_usage, so they would otherwise see
+                    // "0 tokens" in their completions log. Always emit the usage
+                    // chunk on the final message_delta — strict OpenAI clients
+                    // ignore extra fields; clients that care about usage get the
+                    // numbers they expect.
+                    if (true || includeUsage) {
                       sseWrite(`data: ${JSON.stringify({
                         id: chatId, object: 'chat.completion.chunk',
                         created: Math.floor(Date.now()/1000), model,
