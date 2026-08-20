@@ -21,4 +21,14 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=2 \
 ARG PROXY_VERSION=unknown
 ENV PROXY_VERSION=${PROXY_VERSION}
 
+# PHA-2194: structured JSONL access log. Defaults to a path inside the
+# declared volume so the log survives container restarts; the operator
+# MUST mount /var/log/anthropic-proxy on the host (or accept the loss of
+# historical entries on restart). Set up rotation externally — see
+# scripts/logrotate-anthropic-proxy for the recommended logrotate stanza,
+# or rely on Docker json-file log-driver rotation.
+ENV LOG_FILE=/var/log/anthropic-proxy/access.jsonl
+RUN mkdir -p /var/log/anthropic-proxy && chown node:node /var/log/anthropic-proxy
+VOLUME /var/log/anthropic-proxy
+
 CMD ["node", "anthropic-proxy.js", "4010"]

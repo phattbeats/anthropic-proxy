@@ -52,15 +52,16 @@ Mount `~/.claude:/root/.claude:ro` instead of `OAUTH_TOKEN` if preferred.
 ```bash
 curl http://localhost:4010/health      # mode, subscription, token expiry, request totals, ccVersionEmulated
 curl http://localhost:4010/v1/models
+curl http://localhost:4010/v1/usage    # per-session + per-model attribution; ?since=1h filters session rows by lastSeen
 docker logs -f anthropic-proxy | grep USAGE
 ```
 
 ## Logging
 
-Every request emits one structured JSONL line to stdout on completion: `{ts, id, method, route, model, status, latencyMs, tokensIn, tokensOut}`. This is separate from the human-readable `[PROXY]`/`[USAGE]` lines, which stay unchanged.
+Every request emits one structured JSONL line to stdout on completion: `{ts, id, method, route, model, sessionId, status, latencyMs, tokensIn, tokensOut, cacheCreationTokens, cacheReadTokens, ...}`. `sessionId` is the client's `x-claude-code-session-id` (or `x-session-id`) when present, the proxy's stable `INSTANCE_SESSION_ID` otherwise — same derivation as billing-mode.js uses, so cold queries against the JSONL line up with what `/v1/usage` reports live. This is separate from the human-readable `[PROXY]`/`[USAGE]` lines, which stay unchanged.
 
 ```bash
 docker logs -f anthropic-proxy | grep -v '^\[PROXY\]\|^\[USAGE\]'   # JSONL access log only
 ```
 
-Set `LOG_FILE=/path/to/file.jsonl` to also append every line to a file (e.g. mount a volume and set `-e LOG_FILE=/var/log/anthropic-proxy/access.jsonl`). The proxy only appends — it never rotates or truncates this file, so it grows unbounded for the life of the container. Point an external rotator at it (`logrotate`, or your log-shipping agent's own rotation) if you set `LOG_FILE`; otherwise just rely on your container runtime's stdout log rotation (e.g. Docker's `json-file` driver with `max-size`/`max-file`) and skip `LOG_FILE` entirely.
+`LOG_FILE` defaults to `/var/log/anthropic-proxy/access.jsonl` (declared in the Dockerfile, with `/var/log/anthropic-proxy` as a `VOLUME`). To persist across container restarts, mount the volume to a host directory (`-v /mnt/cache/appdata/anthropic-proxy/logs:/var/log/anthropic-proxy`). To use a different path or disable the file mirror entirely, override `LOG_FILE` (e.g. `-e LOG_FILE=` to disable). The proxy only appends — it never rotates or truncates this file, so it grows unbounded for the life of the container. Point an external rotator at it (`logrotate`, or your log-shipping agent's own rotation); a recommended logrotate stanza lives at `scripts/logrotate-anthropic-proxy`. Or rely on your container runtime's stdout log rotation (e.g. Docker's `json-file` driver with `max-size`/`max-file`) and skip `LOG_FILE` entirely.

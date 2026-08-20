@@ -1,0 +1,35 @@
+# PHA-2194: logrotate stanza for the anthropic-proxy JSONL access log.
+#
+# Install on the host (NOT inside the container) — alpine images don't ship
+# logrotate. Place at /etc/logrotate.d/anthropic-proxy on the Unraid host,
+# then `logrotate -d /etc/logrotate.d/anthropic-proxy` to dry-run.
+#
+# The container's VOLUME /var/log/anthropic-proxy is bind-mounted to wherever
+# the Unraid container config maps it; this stanza assumes the canonical
+# /var/log/anthropic-proxy path on the host. Adjust the path if your bind
+# mount differs.
+#
+# Rotation policy:
+#   - daily: small enough to make a single-rotation blowup cheap
+#   - rotate 7: keep a week of history; adjust up if you need more
+#   - compress: gzipped logs are ~5% of raw size at this throughput
+#   - copytruncate: tells logrotate to rename + reopen rather than asking
+#     the writer to close/reopen its fd. The proxy opens LOG_FILE with
+#     `flags: 'a'` once at startup and never reopens — without
+#     copytruncate, rotation will silently keep writing into the rotated
+#     file until restart.
+#
+# Why not dateext: simpler rotate-N scheme is fine for a single-host
+# log that nobody parses by filename; dateext is a footgun if you ever
+# run multiple instances writing to the same path.
+
+/var/log/anthropic-proxy/access.jsonl {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 node node
+}
