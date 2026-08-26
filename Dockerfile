@@ -21,4 +21,14 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=2 \
 ARG PROXY_VERSION=unknown
 ENV PROXY_VERSION=${PROXY_VERSION}
 
+# PHA-1825: bake PROXY_MODE=billing into the image so a recreate that drops
+# orchestrator env (docker compose env_file, unraid template, k8s configmap)
+# can't silently fall back to PROXY_MODE=regular. In non-billing mode,
+# `oauthHeaders()` (anthropic-proxy.js) uses a hardcoded 4-beta list WITHOUT
+# `extended-cache-ttl-2025-04-11` — every cache write then 5m-fallbacks with
+# no error and no log line. Shipping the default makes the silent-fallback
+# class of bug structurally impossible on fresh deployments. Orchestrator
+# `-e PROXY_MODE=...` and `docker run --env-file` still override at run time.
+ENV PROXY_MODE=billing
+
 CMD ["node", "anthropic-proxy.js", "4010"]
