@@ -21,4 +21,19 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=2 \
 ARG PROXY_VERSION=unknown
 ENV PROXY_VERSION=${PROXY_VERSION}
 
+# PHA-1825: bake PROXY_MODE=billing into the image. Two reasons:
+#   1. The proxy's *intended* mode is billing (see billing-mode.js — the entire
+#      module exists because the billing path is the production path). Anyone
+#      who recreates the container without -e PROXY_MODE=... / an env_file
+#      silently lands in PROXY_MODE=regular, which is not the supported
+#      default for this image.
+#   2. Belt-and-braces. OAUTH_BETAS in anthropic-proxy.js currently carries
+#      the extended-cache-ttl-2025-04-11 beta (see PHA-1611), but that fix is
+#      a code-level property that a future contributor could regress without
+#      breaking tests. Defaulting to billing makes the cache_ttl safety net
+#      load-bearing from the image defaults rather than from oauthHeaders().
+# Orchestrator -e PROXY_MODE=... and env_file still override at run time.
+# This is a default, not a force.
+ENV PROXY_MODE=billing
+
 CMD ["node", "anthropic-proxy.js", "4010"]
