@@ -216,7 +216,8 @@ function oauthHeaders() {
 // can't be reached (no token available, or upstream error). The proxy prefers
 // the live list so newly-released models appear automatically with no code edit.
 const MODELS = [
-  // Current shipping models (as of 2026-05)
+  // Current shipping models (as of 2026-09)
+  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1' },
   { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
   { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
   { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
@@ -319,6 +320,7 @@ const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'se
 // used here (default or client-supplied) is clamped per-model below.
 const DEFAULT_MAX_TOKENS = 32768;
 const MODEL_MAX_OUTPUT_TOKENS = [
+  { pattern: /^claude-fable-5/, limit: 128000 },
   { pattern: /^claude-opus-4/, limit: 32000 },
   { pattern: /^claude-sonnet-4/, limit: 64000 },
   { pattern: /^claude-haiku-4/, limit: 64000 },
