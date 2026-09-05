@@ -217,7 +217,7 @@ function oauthHeaders() {
 // the live list so newly-released models appear automatically with no code edit.
 const MODELS = [
   // Current shipping models (as of 2026-09)
-  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1' },
+  { id: 'claude-fable-5', name: 'Claude Fable 5' },
   { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
   { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
   { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
