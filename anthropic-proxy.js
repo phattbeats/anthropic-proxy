@@ -217,16 +217,19 @@ function oauthHeaders() {
 // the live list so newly-released models appear automatically with no code edit.
 const MODELS = [
   // Current shipping models (as of 2026-09)
-  { id: 'claude-fable-5', name: 'Claude Fable 5' },
-  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-  { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-  { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
-  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1' },
+  { id: 'claude-opus-5', name: 'Claude Opus 5' },
+  { id: 'claude-sonnet-5', name: 'Claude Sonnet 5' },
   { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
   { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet (2024-10-22)' },
   { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku (2024-10-22)' },
   // Legacy aliases for compatibility
+  { id: 'claude-fable-5', name: 'Claude Fable 5 (legacy)' },
+  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8 (legacy)' },
+  { id: 'claude-opus-4-7', name: 'Claude Opus 4.7 (legacy)' },
+  { id: 'claude-opus-4-6', name: 'Claude Opus 4.6 (legacy)' },
   { id: 'claude-opus-4-5', name: 'Claude Opus 4.5 (legacy)' },
+  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (legacy)' },
   { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5 (legacy)' },
   { id: 'claude-haiku-3', name: 'Claude Haiku 3 (legacy)' },
 ];
@@ -321,6 +324,8 @@ const STRIP_PARAMS = ['presence_penalty', 'frequency_penalty', 'logit_bias', 'se
 const DEFAULT_MAX_TOKENS = 32768;
 const MODEL_MAX_OUTPUT_TOKENS = [
   { pattern: /^claude-fable-5/, limit: 128000 },
+  { pattern: /^claude-opus-5/, limit: 128000 },
+  { pattern: /^claude-sonnet-5/, limit: 128000 },
   { pattern: /^claude-opus-4/, limit: 32000 },
   { pattern: /^claude-sonnet-4/, limit: 64000 },
   { pattern: /^claude-haiku-4/, limit: 64000 },
