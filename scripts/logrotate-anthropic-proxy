@@ -1,0 +1,20 @@
+# PHA-2194: rotates the structured JSONL access log written to
+# LOG_FILE=/var/log/anthropic-proxy/access.jsonl (see anthropic-proxy.js and
+# the Dockerfile VOLUME declaration). Node never rotates this file itself —
+# without an external rotator it grows unbounded for the life of the
+# container.
+#
+# Install on the HOST (not inside the container) at
+# /etc/logrotate.d/anthropic-proxy, pointing at wherever the
+# /var/log/anthropic-proxy volume is bind-mounted. copytruncate is required
+# because the proxy holds the file open for its whole lifetime (fs.createWriteStream
+# in append mode) and has no signal handler to reopen it after a rename.
+/var/lib/docker/volumes/anthropic-proxy_log/_data/access.jsonl {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

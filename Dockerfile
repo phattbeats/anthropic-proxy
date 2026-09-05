@@ -4,6 +4,18 @@ WORKDIR /app
 # only needs to bind a high port and read its own files; root is unnecessary
 # and a hardening miss (PHA-1844 audit, L1).
 COPY --chown=node:node anthropic-proxy.js billing-mode.js ./
+
+# PHA-2194: the structured JSONL access log (anthropic-proxy.js LOG_FILE) went
+# to stdout only, so it died on every container restart. Default it to a
+# mounted volume so it survives recreates; created + chowned here because the
+# process runs as the unprivileged `node` user and can't mkdir under /var/log
+# itself. Unbounded growth is handled by scripts/logrotate-anthropic-proxy
+# (mount it into /etc/logrotate.d on the host, or add an external logrotate
+# sidecar — Node itself never rotates this file).
+RUN mkdir -p /var/log/anthropic-proxy && chown node:node /var/log/anthropic-proxy
+ENV LOG_FILE=/var/log/anthropic-proxy/access.jsonl
+VOLUME /var/log/anthropic-proxy
+
 USER node
 EXPOSE 4010
 

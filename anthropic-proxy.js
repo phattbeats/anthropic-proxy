@@ -747,13 +747,50 @@ let totalIn = 0;
 let totalOut = 0;
 let totalCacheCreate = 0;
 let totalCacheRead = 0;
-function logUsage(model, u) {
+
+// PHA-2194: per-session / per-model rolling usage so /v1/usage can answer
+// "is character X caching?" without reading client DevTools. Session id comes
+// from x-claude-code-session-id / x-session-id (billing mode) or falls back to
+// a generic per-header derivation in regular mode — see deriveGenericSessionId.
+// Capped at USAGE_MAX_SESSIONS entries (oldest-inserted evicted first) so a
+// long-running proxy with many distinct clients doesn't grow this Map forever.
+const USAGE_MAX_SESSIONS = 10000;
+const sessionUsage = new Map();
+const modelUsage = new Map();
+function recordSessionUsage(sessionId, model, u) {
+  const sid = sessionId || 'unknown';
+  const now = new Date().toISOString();
+  const existing = sessionUsage.get(sid);
+  if (existing) {
+    existing.model = model;
+    existing.totalReq++;
+    existing.lastSeen = now;
+    existing.lastCacheRead = u.cacheRead || 0;
+    existing.lastCacheCreate = u.cacheCreate || 0;
+  } else {
+    if (sessionUsage.size >= USAGE_MAX_SESSIONS) {
+      // Map preserves insertion order — the first key is the oldest entry.
+      sessionUsage.delete(sessionUsage.keys().next().value);
+    }
+    sessionUsage.set(sid, {
+      sessionId: sid, model, totalReq: 1, lastSeen: now,
+      lastCacheRead: u.cacheRead || 0, lastCacheCreate: u.cacheCreate || 0,
+    });
+  }
+  const m = modelUsage.get(model) || { model, totalReq: 0, cacheCreate: 0, cacheRead: 0 };
+  m.totalReq++;
+  m.cacheCreate += u.cacheCreate || 0;
+  m.cacheRead += u.cacheRead || 0;
+  modelUsage.set(model, m);
+}
+function logUsage(model, u, sessionId) {
   const usage = u || EMPTY_USAGE;
   totalReq++;
   totalIn += usage.input || 0;
   totalOut += usage.output || 0;
   totalCacheCreate += usage.cacheCreate || 0;
   totalCacheRead += usage.cacheRead || 0;
+  recordSessionUsage(sessionId, model, usage);
   // Only spell out the 5m/1h split when upstream actually reported one — most
   // responses report neither, and a permanent "(5m=0 1h=0)" is pure noise.
   const ttl = [];
@@ -761,6 +798,15 @@ function logUsage(model, u) {
   if (usage.cache1h) ttl.push(`1h=${usage.cache1h}`);
   const ttlStr = ttl.length ? ` (${ttl.join(' ')})` : '';
   console.log(`[USAGE] model=${model} in=${usage.input || 0} out=${usage.output || 0} cache_write=${usage.cacheCreate || 0}${ttlStr} cache_read=${usage.cacheRead || 0} | totals: req=${totalReq} in=${totalIn} out=${totalOut} cache_write=${totalCacheCreate} cache_read=${totalCacheRead}`);
+}
+// Session id for regular (non-billing) mode: same header contract as billing
+// mode's deriveSessionId (billing-mode.js), duplicated here so this file has
+// no dependency on billing-mode when PROXY_MODE=billing isn't set.
+function deriveGenericSessionId(headers) {
+  const h = headers || {};
+  const incoming = h['x-claude-code-session-id'] || h['x-session-id'];
+  if (incoming && /^[0-9a-fA-F][0-9a-fA-F-]{15,63}$/.test(incoming)) return incoming;
+  return 'unknown';
 }
 // Pull the Anthropic error type out of a JSON error body so the structured
 // access log can record WHY a request returned 0 tokens (e.g. rate_limit_error
@@ -813,12 +859,12 @@ function extractQuota(headers) {
 
 // Returns a normalized usage object when usage was present, else null — callers
 // use this to feed the per-request structured access log without re-parsing.
-function logUsageFromAnthropic(raw, model) {
+function logUsageFromAnthropic(raw, model, sessionId) {
   try {
     const r = JSON.parse(raw);
     if (r.usage) {
       const u = extractUsage(r.usage);
-      logUsage(r.model || model, u);
+      logUsage(r.model || model, u, sessionId);
       return u;
     }
   } catch (e) {}
@@ -827,7 +873,7 @@ function logUsageFromAnthropic(raw, model) {
 // Track usage from SSE message_start / message_delta events. The cache counters
 // only ever arrive on message_start, so the two events must be merged, not
 // replaced, or the cache numbers are lost by the time the stream ends.
-function makeSSEUsageWatcher(model) {
+function makeSSEUsageWatcher(model, sessionId) {
   let buffer = '';
   let usage = { ...EMPTY_USAGE };
   let logged = false;
@@ -851,7 +897,7 @@ function makeSSEUsageWatcher(model) {
     },
     flush() {
       if (!logged && (usage.input || usage.output || usage.cacheCreate || usage.cacheRead)) {
-        logUsage(model, usage);
+        logUsage(model, usage, sessionId);
         logged = true;
       }
     },
@@ -1052,6 +1098,21 @@ const handler = (req, res) => {
       return res.end(JSON.stringify(health));
     }
 
+    // PHA-2194: per-session / per-model usage attribution, backed by the
+    // in-memory sessionUsage/modelUsage Maps populated in logUsage(). Read-only,
+    // no auth boundary — served before the API-key check like /health. `since`
+    // is accepted for API-shape completeness but rows are already bounded by
+    // USAGE_MAX_SESSIONS eviction, not by a timestamp filter.
+    if (req.url === '/v1/usage' || req.url.startsWith('/v1/usage?')) {
+      const usage = {
+        summary: { req: totalReq, in: totalIn, out: totalOut, cacheCreate: totalCacheCreate, cacheRead: totalCacheRead },
+        sessions: [...sessionUsage.values()],
+        byModel: [...modelUsage.values()],
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(usage));
+    }
+
     // Readiness endpoint — actively probes upstream Anthropic so an orchestrator
     // can keep a half-broken pod out of the LB rotation. Returns 503 when the
     // upstream is unreachable, with the failure reason in the body. Bounded by
@@ -1100,6 +1161,11 @@ const handler = (req, res) => {
     // is a distinct Claude Code session rather than all sharing one. Computed once
     // here and reused for the billing headers and the body metadata.
     const billingSessionId = BILLING_MODE ? billing.deriveSessionId(req.headers) : null;
+    // PHA-2194: session id used for /v1/usage attribution, independent of billing
+    // mode. Reuses the billing-derived id when available so a client's sessions
+    // line up across both surfaces; otherwise derives it directly from headers.
+    const usageSessionId = billingSessionId || deriveGenericSessionId(req.headers);
+    res.setHeader('X-Proxy-Session-Id', usageSessionId);
 
     // Build outbound headers
     const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
@@ -1315,7 +1381,7 @@ const handler = (req, res) => {
           proxyRes.on('end', () => {
             const tail = xform ? xform.onEnd() : rawDecoder.end();
             if (tail) handleLines(tail);
-            if (usage.input || usage.output || usage.cacheCreate || usage.cacheRead) logUsage(model, usage);
+            if (usage.input || usage.output || usage.cacheCreate || usage.cacheRead) logUsage(model, usage, usageSessionId);
             logUsageAcc = usage;
             res.end();
           });
@@ -1331,7 +1397,7 @@ const handler = (req, res) => {
             let buf = Buffer.concat(respChunks);
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
             const raw = buf.toString();
-            const u = logUsageFromAnthropic(raw, model);
+            const u = logUsageFromAnthropic(raw, model, usageSessionId);
             if (u) logUsageAcc = u;
             const converted = anthropicToOpenAI(raw, model, false);
             res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
@@ -1438,7 +1504,7 @@ const handler = (req, res) => {
           // cooldown and surfaced as immediate 429s, and killed streams mid-reply.
           // Relay incrementally again, with backpressure + the per-stream idle
           // timeout (H3, PHA-1844a) that M5 had also dropped here.
-          const usageWatcher = makeSSEUsageWatcher(model);
+          const usageWatcher = makeSSEUsageWatcher(model, usageSessionId);
           // Non-2xx upstream replies to a stream request are a single JSON error
           // body, not SSE. Buffer those so the error type reaches the access log
           // and the client gets a well-framed JSON error (same shape as the
@@ -1535,7 +1601,7 @@ const handler = (req, res) => {
             let buf = Buffer.concat(respChunks);
             if (BILLING_MODE) buf = billing.reverseMapBuffer(buf);
             const raw = buf.toString();
-            const u = logUsageFromAnthropic(raw, model);
+            const u = logUsageFromAnthropic(raw, model, usageSessionId);
             if (u) logUsageAcc = u;
             if (upRes.statusCode >= 400) {
               logErrorType = extractAnthropicErrorType(raw) || `upstream_${upRes.statusCode}`;
@@ -1665,4 +1731,4 @@ server.listen(PORT, '0.0.0.0', () => {
 // Test seam only. When the proxy is started normally (`node anthropic-proxy.js`)
 // require.main === module, so this is a no-op and nothing above it changes.
 // scripts/pha1596-usage-unit.js requires the file to unit-test the pure helpers.
-if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, mapOpenAIContentParts, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS, extractAnthropicErrorType };
+if (require.main !== module) module.exports = { extractUsage, mergeUsage, openAIUsage, makeSSEUsageWatcher, openAIToAnthropic, mapOpenAIContentParts, capCacheControl, attachStreamIdleTimeout, SSE_IDLE_TIMEOUT_MS, extractAnthropicErrorType, logUsage, deriveGenericSessionId, sessionUsage, modelUsage };
