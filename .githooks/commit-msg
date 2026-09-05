@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# Enforce the repository's sole-author policy before a commit reaches GitHub.
+set -eu
+
+message_file=${1:?commit message path is required}
+expected_ident='phattbeats <obiwouldjablowme@protonmail.com>'
+author_ident=$(git var GIT_AUTHOR_IDENT | sed -E 's/ [0-9]+ [+-][0-9]{4}$//')
+
+if [ "$author_ident" != "$expected_ident" ]; then
+  printf '%s\n' "Rejected commit: author must be $expected_ident; got $author_ident." >&2
+  exit 1
+fi
+
+if grep -Eiq '^co-authored-by:' "$message_file"; then
+  printf '%s\n' 'Rejected commit: Co-authored-by trailers are forbidden.' >&2
+  exit 1
+fi

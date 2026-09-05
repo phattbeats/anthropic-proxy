@@ -64,3 +64,7 @@ docker logs -f anthropic-proxy | grep -v '^\[PROXY\]\|^\[USAGE\]'   # JSONL acce
 ```
 
 Set `LOG_FILE=/path/to/file.jsonl` to also append every line to a file (e.g. mount a volume and set `-e LOG_FILE=/var/log/anthropic-proxy/access.jsonl`). The proxy only appends — it never rotates or truncates this file, so it grows unbounded for the life of the container. Point an external rotator at it (`logrotate`, or your log-shipping agent's own rotation) if you set `LOG_FILE`; otherwise just rely on your container runtime's stdout log rotation (e.g. Docker's `json-file` driver with `max-size`/`max-file`) and skip `LOG_FILE` entirely.
+
+## Authorship
+
+Every commit must be authored by `phattbeats <obiwouldjablowme@protonmail.com>` with **no** `Co-authored-by` trailer. See [docs/AUTHORSHIP.md](docs/AUTHORSHIP.md) and run `./scripts/install-git-hooks.sh` once per clone.

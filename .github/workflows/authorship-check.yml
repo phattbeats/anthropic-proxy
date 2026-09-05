@@ -1,0 +1,46 @@
+name: Authorship check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate-commit-range:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require phattbeats-only authorship
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          expected='phattbeats <obiwouldjablowme@protonmail.com>'
+
+          if [ "$EVENT_NAME" = pull_request ]; then
+            commits=$(git rev-list "$PR_BASE_SHA..$PR_HEAD_SHA")
+          elif [ "$PUSH_BEFORE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            commits=$(git rev-list "$GITHUB_SHA")
+          else
+            commits=$(git rev-list "$PUSH_BEFORE_SHA..$GITHUB_SHA")
+          fi
+
+          for sha in $commits; do
+            author=$(git show -s --format='%an <%ae>' "$sha")
+            if [ "$author" != "$expected" ]; then
+              echo "::error::${sha}: author must be ${expected}; got ${author}"
+              exit 1
+            fi
+
+            trailer=$(git show -s --format=%B "$sha" | grep -inE '^co-authored-by:' || true)
+            if [ -n "$trailer" ]; then
+              echo "::error::${sha}: forbidden trailer: ${trailer}"
+              exit 1
+            fi
+          done
